@@ -23,6 +23,10 @@ import { firstUrl, run, stripAnsi } from "./process";
 import { retryDelayMs } from "./usage";
 
 const API = "https://api.anthropic.com";
+/** Usage plus banked resets, and extra-usage spend (Claude Code's own /usage reads spend too). */
+const USAGE_WITH_SPEND = `${API}/api/oauth/usage?cedar_ember=1`;
+/** The same read without spend: the fallback, and all a reset redeem needs. */
+const USAGE_WITHOUT_SPEND = `${USAGE_WITH_SPEND}&skip_spend=1`;
 
 function apiHeaders(token: string): Record<string, string> {
   return {
@@ -113,10 +117,12 @@ export class ClaudeAdapter implements FamilyAdapter {
     if (credentials?.accessToken && isFresh(credentials) && profileScope) {
       try {
         // The `cedar_ember` read is the one Claude Code's /limit-reset makes: usage plus banked resets.
-        const response = await fetch(`${API}/api/oauth/usage?cedar_ember=1&skip_spend=1`, {
-          headers: apiHeaders(credentials.accessToken),
-          signal: AbortSignal.timeout(15_000),
-        });
+        // Spend (`extra_usage`) costs Anthropic another lookup, which `skip_spend` avoids; ask for it,
+        // and if that read fails on Anthropic's side, take the windows without it rather than none.
+        const token = credentials.accessToken;
+        const read = (url: string) => fetch(url, { headers: apiHeaders(token), signal: AbortSignal.timeout(15_000) });
+        let response = await read(USAGE_WITH_SPEND);
+        if (response.status >= 500) response = await read(USAGE_WITHOUT_SPEND);
         if (response.ok) {
           const body = (await response.json()) as { cedar_ember?: unknown; extra_usage?: unknown };
           const windows = parseUsage(body);
@@ -191,7 +197,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     // Ask which grant is next: the server only accepts that one.
     let status: ReturnType<typeof parseClaudeResets>;
     try {
-      const response = await fetch(`${API}/api/oauth/usage?cedar_ember=1&skip_spend=1`, {
+      const response = await fetch(USAGE_WITHOUT_SPEND, {
         headers: apiHeaders(token),
         signal: AbortSignal.timeout(15_000),
       });

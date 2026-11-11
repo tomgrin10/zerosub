@@ -48,8 +48,9 @@ export type Credits = z.infer<typeof CreditsSchema>;
 
 /**
  * Pay-as-you-go usage past the plan's limits (Claude "extra usage"), as the usage response reports it.
- * `spend` and `limit` are Claude's `used_credits` and `monthly_limit`, in its own units; `null` when
- * the response leaves them out (ZeroSub's read asks Anthropic to skip spend, so `spend` often is).
+ * `spend` and `limit` are Claude's `used_credits` and `monthly_limit`, in minor units of `currency`
+ * (cents for USD); `null` when the response leaves them out, or when Anthropic's spend lookup failed
+ * and ZeroSub fell back to the read without spend (the last known value is then kept).
  */
 export const ExtraUsageSchema = z.object({
   enabled: z.boolean(),

@@ -71,6 +71,14 @@ describe("the account button", () => {
     );
   });
 
+  it("says when pace put the agent on its account, without offering to undo a pin it never had", async () => {
+    const items = await menu({ selectionReason: "pace", pinned: false, movable: true });
+    expect(items).toContainEqual(
+      expect.objectContaining({ id: "selection-reason", title: "Placed here to pace weekly usage", disabled: true }),
+    );
+    expect(items.map((entry) => entry.id)).not.toContain("follow-default");
+  });
+
   it("has no reason row for an agent placed any other way", async () => {
     expect((await menu({})).map((entry) => entry.id)).not.toContain("selection-reason");
   });

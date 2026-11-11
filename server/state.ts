@@ -39,10 +39,11 @@ export const BindingSchema = z.object({
   accountId: z.string(),
   /**
    * `user`: chosen in the UI. `auto`: moved after a limit, or kept on its account when the default
-   * changed. `balance`: spread at creation.
+   * changed. `balance`: spread at creation. `pace`: placed or moved to pace weekly usage; pace may
+   * move it again, and it goes back to the default when pacing is turned off.
    * `thread`: a conversation that can't change accounts, pinned where it started.
    */
-  source: z.enum(["user", "auto", "balance", "thread"]),
+  source: z.enum(["user", "auto", "balance", "thread", "pace"]),
   at: z.string(),
   selectionReason: z.enum(["weekly_reset", "headroom"]).optional(),
 });

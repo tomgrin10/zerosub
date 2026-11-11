@@ -45,6 +45,7 @@ import { Reopener } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
+import { PACE, paceBindingsToDrop, planPaceMove, type PaceAgent, type PaceMove } from "./pace";
 import {
   MAIN_ACCOUNT_ID,
   StateStore,
@@ -90,6 +91,8 @@ const AGENT_LIST_MS = 3_000;
 const ROUTING_WAIT_MS = 5_000;
 /** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
 const TURN_READ_MS = 10_000;
+/** How often upkeep looks for a pace move. Moves themselves are spaced by `PACE.moveEveryMs`. */
+const PACE_CHECK_MS = 60_000;
 
 const DEFAULT_PREFERENCES: Preferences = {
   autoSwitch: true,
@@ -97,6 +100,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   continuePrompt: DEFAULT_CONTINUE_PROMPT,
   moveAgentsOnDefaultChange: true,
   balanceNewAgents: false,
+  paceWeeklyUsage: true,
   showComposerPill: true,
   autoRedeem: false,
   useCredits: false,
@@ -125,6 +129,12 @@ interface AgentInfo {
   title: string | null;
   /** The agent this one carries on from, when ZeroSub started it as a continuation. */
   continuedFrom: string | null;
+  /** Permission prompts waiting on the user. */
+  pendingPermissions: number;
+  /** When Paseo last changed the agent (status, turn, title), epoch ms. */
+  updatedAt: number;
+  /** Tokens in its context window after the last turn, when Paseo knows. */
+  contextTokens: number | null;
 }
 
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
@@ -184,6 +194,11 @@ export class Service {
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
   private lastPrune = 0;
+  /** The last pace move (either direction) and the last look for one, epoch ms. */
+  private lastPaceMoveAt = 0;
+  private lastPaceCheckAt = 0;
+  /** Agents the user re-routed by hand, and when: pace leaves them alone for a while. */
+  private readonly routedByHand = new Map<string, number>();
   private collecting = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
@@ -292,6 +307,101 @@ export class Service {
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
     if (this.paseo) await this.collectOrphanHomes(this.paseo);
+    if (this.paseo && now - this.lastPaceCheckAt >= PACE_CHECK_MS) {
+      this.lastPaceCheckAt = now;
+      await this.pace(this.paseo).catch((error: unknown) => log("pacing weekly usage failed", error));
+    }
+  }
+
+  // ------------------------------------------------------------------ pacing weekly usage
+
+  /**
+   * One step of "Pace weekly usage" (see pace.ts): drop pace bindings that need no reload, then make
+   * at most one move, spaced by `PACE.moveEveryMs`. Only ever reloads one open, idle, recently active
+   * agent; never reconciles in bulk, never touches a closed or archived agent.
+   */
+  async pace(paseo: PaseoApi, now: number = Date.now()): Promise<PaceMove | null> {
+    const enabled = this.prefs.paceWeeklyUsage;
+    const families = await this.families.resolve(paseo);
+    const { agents, complete } = await listAgents(paseo, false);
+    const open = new Set(agents.filter((agent) => !agent.archived && isLive(agent.status)).map((agent) => agent.id));
+    const drop = paceBindingsToDrop(await this.store.read(), enabled, complete ? open : null);
+    if (drop.length > 0) {
+      await this.store.update((draft) => {
+        for (const agentId of drop) if (draft.bindings[agentId]?.source === "pace") delete draft.bindings[agentId];
+      });
+      console.log(`[ZeroSub] weekly pacing is off; ${drop.length} agent(s) follow the default again`);
+    }
+    const state = await this.store.read();
+    for (const family of FAMILIES) {
+      // A conversation that can't change accounts is never paced.
+      if (!this.adapters[family].portable) continue;
+      const candidates: PaceAgent[] = agents
+        .filter((agent) => families[agent.provider] === family)
+        .map((agent) => ({
+          id: agent.id,
+          family,
+          status: agent.status,
+          archived: agent.archived,
+          pendingPermissions: agent.pendingPermissions,
+          updatedAt: agent.updatedAt,
+          contextTokens: agent.contextTokens,
+          runningOn: state.sessions[agent.id]?.accountId,
+        }));
+      const move = planPaceMove({
+        state,
+        family,
+        agents: candidates,
+        usageOf: (id) => this.usage.get(id),
+        now,
+        enabled,
+        lastMoveAt: this.lastPaceMoveAt,
+        recentlyRouted: (agentId) => this.switching.has(agentId) || now - (this.routedByHand.get(agentId) ?? 0) < PACE.agentCooldownMs,
+      });
+      if (!move) continue;
+      // Counts even if the move doesn't happen, so a failing reload can't turn into a burst.
+      this.lastPaceMoveAt = now;
+      await this.applyPaceMove(paseo, move, now);
+      return move;
+    }
+    return null;
+  }
+
+  private async applyPaceMove(paseo: PaseoApi, move: PaceMove, now: number): Promise<void> {
+    const { agentId, family } = move;
+    // The list may be a moment old: look again, and leave anything that isn't idle now.
+    const info = await agentInfo(paseo, agentId);
+    if (!info || info.archived || info.status !== "idle") return;
+    this.switching.add(agentId);
+    try {
+      const seen = (await this.store.read()).bindings[agentId];
+      const state = await this.store.update((draft) => {
+        // The user (or a limit) may have re-routed it since the plan was made.
+        if (JSON.stringify(draft.bindings[agentId]) !== JSON.stringify(seen)) return;
+        if (move.to) draft.bindings[agentId] = { accountId: move.to, source: "pace", at: new Date(now).toISOString() };
+        else if (draft.bindings[agentId]?.source === "pace") delete draft.bindings[agentId];
+      });
+      const target = this.targetFor(state, agentId, family);
+      if (!target || target === move.from) return;
+      const row: SwitchRow = {
+        family,
+        from: findAccount(state, move.from)?.label ?? null,
+        to: findAccount(state, target)?.label ?? target,
+        reason: move.reason,
+        resetsAt: null,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        outcome: "switched",
+        detail: null,
+        at: new Date(now).toISOString(),
+      };
+      const outcome = await this.reopenAgent(paseo, agentId, row);
+      console.log(`[ZeroSub] pace: ${agentId} ${row.from ?? move.from} → ${row.to} (${move.reason}): ${outcome}`);
+      if (outcome === "reopened") await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+    } finally {
+      this.switching.delete(agentId);
+    }
   }
 
   private async refreshIdentity(accountId: string): Promise<void> {
@@ -428,6 +538,7 @@ export class Service {
       now,
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
+      paceWeeklyUsage: this.prefs.paceWeeklyUsage,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
     });
@@ -1442,12 +1553,17 @@ export class Service {
         agentId: agent.id,
         family,
         accountId,
-        pinned: Boolean(binding && binding.source !== "thread"),
+        // Pace placed it, not the user: it isn't shown as a pin.
+        pinned: Boolean(binding && binding.source !== "thread" && binding.source !== "pace"),
         // Only while the agent is still on the account that was picked for it.
         selectionReason:
-          binding?.source === "balance" && binding.selectionReason === "weekly_reset" && binding.accountId === accountId
-            ? "weekly_reset"
-            : undefined,
+          binding?.accountId !== accountId
+            ? undefined
+            : binding.source === "pace"
+              ? "pace"
+              : binding.source === "balance" && binding.selectionReason === "weekly_reset"
+                ? "weekly_reset"
+                : undefined,
         pendingAccountId: current && current !== accountId ? current : null,
         movable: this.adapters[family].portable || !agent.hasHistory,
       });
@@ -1708,6 +1824,7 @@ export class Service {
       }
     }
 
+    this.routedByHand.set(agentId, Date.now());
     await this.store.update((draft) => {
       if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
       else delete draft.bindings[agentId];
@@ -1982,6 +2099,9 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     hasHistory: Boolean(agent.lastUserMessageAt),
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
+    pendingPermissions: agent.pendingPermissions?.length ?? 0,
+    updatedAt: Date.parse(agent.updatedAt ?? "") || 0,
+    contextTokens: agent.lastUsage?.contextWindowUsedTokens ?? null,
   };
 }
 

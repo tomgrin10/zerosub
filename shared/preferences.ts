@@ -29,6 +29,12 @@ export const preferences = defineSettings({
      * agents go there, and recently active idle agents move there one at a time. Pins stay put.
      */
     paceWeeklyUsage: z.boolean().default(true),
+    /**
+     * Paseo sometimes leaves an agent with an extra provider process that nothing tracks any more
+     * (getpaseo/paseo#9408). Stop one that isn't the agent's newest and is on another account, or has
+     * been idle for 10 minutes; never while the agent is mid-turn.
+     */
+    reapDetachedDuplicates: z.boolean().default(true),
     /** When every account of a provider is at its limit, spend a banked reset instead of stopping. */
     autoRedeem: z.boolean().default(false),
     /**

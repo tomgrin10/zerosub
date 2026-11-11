@@ -129,6 +129,8 @@ export interface PaceAgent {
   updatedAt: number;
   /** Tokens in its context window after the last turn; a move costs a cache miss of about this much. */
   contextTokens: number | null;
+  /** Background jobs it has running; a move would kill them, so only 0 qualifies. */
+  backgroundJobs: number;
   /** The account its live session runs on. */
   runningOn: string | undefined;
 }
@@ -161,12 +163,13 @@ export function paceMayMove(binding: Binding | undefined): boolean {
 }
 
 /**
- * Open, between turns, nothing asked of the user, quiet for a few minutes but active within the last
- * few hours. Closed, archived, running, failed, dormant and background agents never qualify.
+ * Open, between turns, nothing asked of the user, no background jobs (a move would kill them), quiet
+ * for a few minutes but active within the last few hours. Closed, archived, running, failed, dormant
+ * and background agents never qualify.
  */
 export function paceCanTouch(agent: PaceAgent, now: number): boolean {
   const idle = now - agent.updatedAt;
-  return !agent.archived && !agent.background && agent.status === "idle" && agent.pendingPermissions === 0 &&
+  return !agent.archived && !agent.background && agent.backgroundJobs === 0 && agent.status === "idle" && agent.pendingPermissions === 0 &&
     Number.isFinite(idle) && idle >= PACE.minIdleMs && idle <= PACE.maxIdleMs;
 }
 

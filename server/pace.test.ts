@@ -74,6 +74,7 @@ function agent(id: string, partial: Partial<PaceAgent> = {}): PaceAgent {
     family: "claude",
     status: "idle",
     archived: false,
+    background: false,
     pendingPermissions: 0,
     updatedAt: NOW - 30 * 60_000,
     contextTokens: 50_000,
@@ -267,6 +268,9 @@ describe("moving idle agents", () => {
   it("never picks a closed, archived, running, failed, starting or waiting agent", () => {
     for (const status of ["closed", "running", "initializing", "error"]) expect(plan({ agents: [agent("a", { status })] })).toBeNull();
     expect(plan({ agents: [agent("a", { archived: true })] })).toBeNull();
+    // A background helper (another plugin's job) is never ours to move, whatever its binding.
+    expect(plan({ agents: [agent("a", { background: true })] })).toBeNull();
+    expect(plan({ agents: [agent("a", { background: true }), agent("b")] })?.agentId).toBe("b");
     expect(plan({ agents: [agent("a", { pendingPermissions: 1 })] })).toBeNull();
     // Never opened by ZeroSub: no session to move.
     expect(plan({ agents: [agent("a", { runningOn: undefined })] })).toBeNull();

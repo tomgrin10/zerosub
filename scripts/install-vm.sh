@@ -41,6 +41,9 @@ BACKUP=$BACKUP_ROOT/live-backup-$(date -u +%Y%m%dT%H%M%S)
 mkdir -p "$BACKUP"
 cp "$PREFS" "$PASEO_HOME/config.json" "$BACKUP"/
 [[ -f $PASEO_HOME/plugins/sources.json ]] && cp "$PASEO_HOME/plugins/sources.json" "$BACKUP"/
+# Not restored by this script, but a new build may rewrite bindings on start (a prune bug once did), so keep
+# a copy to diff or roll back by hand.
+[[ -f $PASEO_HOME/zerosub/state.json ]] && cp "$PASEO_HOME/zerosub/state.json" "$BACKUP"/
 cmp -s "$PREFS" "$BACKUP/preferences.json" || die "backup of preferences doesn't match"
 echo "install-vm: backup in $BACKUP"
 

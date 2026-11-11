@@ -26,20 +26,33 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
 
 ## Installing a build on the VM (for the orchestrator)
 
-Editing `plugins.zerosub.path` in `~/.paseo/config.json` and reloading does not work: the daemon keeps its config in
-memory and writes the old path back. What works without a daemon restart:
+Use the script; don't run the steps by hand:
 
 ```sh
-F=~/.paseo/plugins/zerosub-fork/<version>
-B=~/paseo-harness/zerosub-pace/live-backup-$(date +%Y%m%dT%H%M%S); mkdir -p "$B"
-cp ~/.paseo/plugin-settings/zerosub/preferences.json ~/.paseo/config.json ~/.paseo/plugins/sources.json "$B"/
-mkdir -p "$F" && tar xzf <tarball> -C "$F" --strip-components=1
-paseo plugin remove zerosub                 # also deletes plugin-settings/zerosub/preferences.json
-paseo plugin install "$F"
-mkdir -p ~/.paseo/plugin-settings/zerosub && cp "$B"/preferences.json ~/.paseo/plugin-settings/zerosub/
-paseo plugin reload zerosub
-paseo plugin ls zerosub                     # path=$F, status running
+scripts/install-vm.sh ~/paseo-harness/zerosub-pace/kapybara-zerosub-<version>.tgz
 ```
 
-`~/.paseo/zerosub` (accounts, homes, bindings) is never touched by this. Roll back the same way with
-`paseo plugin install kapybara-org/zerosub`.
+It never restarts Paseo and never touches `~/.paseo/zerosub` (accounts, homes, bindings). Two facts drive it:
+
+- Editing `plugins.zerosub.path` in `~/.paseo/config.json` and reloading doesn't work: the daemon keeps its config in
+  memory and writes the old path back. The build has to be swapped with `paseo plugin remove` + `paseo plugin install`.
+- `paseo plugin remove zerosub` deletes the whole `~/.paseo/plugin-settings/zerosub/` directory, preferences included.
+  Restoring them by hand once ran zerosub on default preferences for about 20 s, because `cp` into the missing
+  directory failed.
+
+So the script runs under `set -euo pipefail` and does the following:
+
+1. It refuses up front when zerosub isn't installed, when the version is already installed, or when there are no
+   preferences to carry over.
+2. It backs up `preferences.json`, `config.json` and `sources.json` to
+   `~/paseo-harness/zerosub-pace/live-backup-<UTC time>/`, then `cmp`s the preferences against the backup.
+3. It unpacks the tarball to `~/.paseo/plugins/zerosub-fork/<version>`. An existing directory there must hold exactly
+   this tarball.
+4. It removes the old build and restores the preferences (`mkdir -p` + `cp` + `cmp`) **before** installing, so the
+   new build starts on them.
+5. It installs, `cmp`s again, and reloads only on a byte-for-byte match. After the reload it `cmp`s once more and
+   checks that the daemon reports the new path, enabled.
+6. If anything fails after the remove, it prints the exact commands that put the old build and its preferences back.
+
+To roll back, run the script with the previous tarball. To go back to the registry build, use
+`paseo plugin install kapybara-org/zerosub` and restore `preferences.json` from the backup the same way.

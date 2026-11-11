@@ -46,6 +46,12 @@ export function describeRow(row: SwitchRow): string {
       reset ? `; ${row.from ?? "this one"} resets ${reset}` : ""
     }. Add another account, use a banked reset from the account button, or wait.${row.detail ? ` ${row.detail}` : ""}`;
   }
+  if (row.reason === "pace" && row.outcome === "switched") {
+    return `Moved ${row.from ? `from ${row.from} ` : ""}to ${row.to} to pace weekly usage.`;
+  }
+  if (row.reason === "pace_off" && row.outcome === "switched") {
+    return `Back on ${row.to}, the default, now that weekly pacing is off.`;
+  }
   if (row.outcome === "reset") {
     return `${row.from ?? "This account"} hit its usage limit, so a banked reset was used. ${row.detail ?? "Limits reset."}${
       row.continued ? " Carrying on." : ""

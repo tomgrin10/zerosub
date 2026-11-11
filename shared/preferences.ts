@@ -24,6 +24,11 @@ export const preferences = defineSettings({
     moveAgentsOnDefaultChange: z.boolean().default(true),
     /** New agents choose an account by usage instead of the default. */
     balanceNewAgents: z.boolean().default(false),
+    /**
+     * Steer Claude work to the account whose weekly quota is most at risk of resetting unused: new
+     * agents go there, and recently active idle agents move there one at a time. Pins stay put.
+     */
+    paceWeeklyUsage: z.boolean().default(true),
     /** When every account of a provider is at its limit, spend a banked reset instead of stopping. */
     autoRedeem: z.boolean().default(false),
     /**

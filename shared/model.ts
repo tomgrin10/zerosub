@@ -104,8 +104,11 @@ export const AgentRouteSchema = z.object({
    * continues the work in a new agent instead.
    */
   movable: z.boolean(),
-  /** The agent started on this account because its weekly reset was near, and is still on it. */
-  selectionReason: z.literal("weekly_reset").optional(),
+  /**
+   * `weekly_reset`: started on this account because its weekly reset was near. `pace`: placed or
+   * moved here to pace weekly usage. Only while the agent is still on that account.
+   */
+  selectionReason: z.enum(["weekly_reset", "pace"]).optional(),
 });
 export type AgentRoute = z.infer<typeof AgentRouteSchema>;
 

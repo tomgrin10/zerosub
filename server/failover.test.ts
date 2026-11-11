@@ -625,7 +625,8 @@ describe("disabling an account", () => {
 
 describe("usage readings", () => {
   const CREDITS = { balance: 57714.93, unlimited: false };
-  const USE_CREDITS = preferences.schema.parse({ useCredits: true });
+  // Pacing would send new work to the account with room left; these are about credits alone.
+  const USE_CREDITS = preferences.schema.parse({ useCredits: true, paceWeeklyUsage: false });
   const NEW_AGENT = "agent-new";
   const full = (credits: UsageRead["credits"]) => (): UsageRead => ({
     fetchedAt: new Date().toISOString(),

@@ -202,10 +202,10 @@ function buttonFor(
     });
   }
   if (wayOut.length > 0) items.unshift(...wayOut, { kind: "separator", id: "way-out-divider" });
-  if (route?.selectionReason === "weekly_reset") {
+  if (route?.selectionReason) {
     items.push({
       kind: "item", id: "selection-reason",
-      title: "Started here: weekly reset was near",
+      title: route.selectionReason === "pace" ? "Placed here to pace weekly usage" : "Started here: weekly reset was near",
       icon: "Info", disabled: true, behavior: { kind: "action", onPress() {} },
     });
   }

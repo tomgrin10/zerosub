@@ -66,6 +66,13 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving}
             onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
           />
+          <SettingsSwitch
+            label="Pace weekly usage"
+            hint="New Claude agents start on the account whose weekly limit would otherwise reset unused, and recently used idle ones move there one at a time; agents you placed yourself stay put."
+            value={settings.values.paceWeeklyUsage}
+            disabled={settings.saving}
+            onValueChange={(paceWeeklyUsage) => save({ paceWeeklyUsage })}
+          />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Automatic switching">

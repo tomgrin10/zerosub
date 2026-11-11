@@ -25,6 +25,10 @@ export const SwitchRowSchema = z.object({
     "enabled",
     /** Every account of this provider is at its limit; nothing to switch to. */
     "exhausted",
+    /** Moved to the account whose weekly quota is most at risk of resetting unused. */
+    "pace",
+    /** Pacing was turned off, and this agent follows the default again. */
+    "pace_off",
   ]),
   /** When the exhausted account frees up again, if known. */
   resetsAt: z.string().nullable(),

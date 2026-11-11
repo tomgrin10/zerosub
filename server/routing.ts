@@ -1,6 +1,7 @@
 import { accountPeak } from "../shared/format";
 import type { Family, Usage } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
+import { pacePick } from "./pace";
 import {
   accountsOf,
   defaultAccount,
@@ -96,6 +97,8 @@ export interface RouteInput {
   now: number;
   autoSwitch: boolean;
   balanceNewAgents: boolean;
+  /** Place new portable agents on the account whose weekly quota is most at risk of resetting unused. */
+  paceWeeklyUsage?: boolean;
   /**
    * Whether an existing conversation can open on a different account. When it can't (Codex), a
    * thread stays on the account it started on, and only brand-new agents are balanced or rerouted.
@@ -130,6 +133,14 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let account = bound && bound.family === input.family ? bound : undefined;
   let bind: Binding | null = null;
 
+  if (!account && fresh && input.paceWeeklyUsage && input.portable && accounts.length > 1) {
+    const paced = pacePick(state, input.family, input.usageOf, input.now);
+    // Landing on the default changes nothing, so the agent just follows it (and pace may move it later).
+    if (paced && paced.id !== defaultAccount(state, input.family)?.id) {
+      account = paced;
+      bind = { accountId: paced.id, source: "pace", at };
+    }
+  }
   if (!account && fresh && input.balanceNewAgents && accounts.length > 1) {
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
     account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);

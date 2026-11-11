@@ -70,6 +70,8 @@ interface Listed {
   quietFor?: number;
   contextTokens?: number;
   background?: boolean;
+  /** Paseo's background-work count; absent: none recorded. */
+  backgroundJobs?: number;
 }
 
 async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, paceWeeklyUsage = true) {
@@ -99,6 +101,7 @@ async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, p
     lastUsage: { contextWindowUsedTokens: entry.contextTokens ?? 50_000 },
     background: entry.background ?? false,
     workspaceId: entry.background ? `wks-bg-${entry.id}` : "wks-main",
+    ...(entry.backgroundJobs !== undefined ? { backgroundWork: { count: entry.backgroundJobs } } : {}),
   }));
   // Background agents open in a background workspace of their own; the hook can only see that.
   const workspaces = new Map<string, { id: string; background: boolean }>([["wks-main", { id: "wks-main", background: false }]]);
@@ -292,5 +295,40 @@ describe("pacing weekly usage", () => {
     expect(Object.values(state.bindings).filter((binding) => binding.source === "pace")).toEqual([]);
     expect(reopened).not.toContain("closed");
     expect(reopened).not.toContain("gone");
+  });
+});
+
+describe("background work (invariant: zerosub never kills an agent's background work to move it)", () => {
+  it("pace never moves an agent that has background work, even the cheapest", async () => {
+    // "render" is the cheapest to move (smallest context) but has a run_in_background job going.
+    const { service, paseo, reopened } = await setUp([
+      { id: "render", contextTokens: 1_000, backgroundJobs: 1 },
+      { id: "plain", contextTokens: 90_000 },
+      { id: "done", contextTokens: 80_000, backgroundJobs: 0 },
+    ]);
+    await run(service, paseo, reopened, 60);
+    expect(reopened).not.toContain("render");
+    expect(reopened).toContain("plain");
+  });
+
+  it("an account change defers an agent with background work instead of reloading it", async () => {
+    const { service, paseo, reopened } = await setUp([{ id: "render", backgroundJobs: 2 }, { id: "plain" }]);
+    const summary = await service.setDefault(paseo, SEAT);
+    expect(reopened).toEqual(["plain"]);
+    expect(summary.deferred).toContain("render");
+  });
+
+  it("a move the user asks for still happens, with a warning that the background jobs stop", async () => {
+    const { service, paseo, reopened } = await setUp([{ id: "render", backgroundJobs: 1 }]);
+    const warnings: string[] = [];
+    const warn = console.warn;
+    console.warn = (...args: unknown[]) => void warnings.push(args.join(" "));
+    try {
+      await service.setAgentAccount(paseo, "render", SEAT);
+    } finally {
+      console.warn = warn;
+    }
+    expect(reopened).toEqual(["render"]);
+    expect(warnings.join("\n")).toMatch(/render.*1 background job.*stop/);
   });
 });

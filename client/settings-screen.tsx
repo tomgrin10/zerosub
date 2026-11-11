@@ -73,6 +73,13 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving}
             onValueChange={(paceWeeklyUsage) => save({ paceWeeklyUsage })}
           />
+          <SettingsSwitch
+            label="Stop stray agent processes"
+            hint="Paseo can leave an agent with an extra Claude or Codex process nothing uses. ZeroSub stops one that's on another account or has sat idle for 10 minutes, never the one the agent is using, and never mid-turn."
+            value={settings.values.reapDetachedDuplicates}
+            disabled={settings.saving}
+            onValueChange={(reapDetachedDuplicates) => save({ reapDetachedDuplicates })}
+          />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Automatic switching">

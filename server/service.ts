@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { readdir } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import type {
   PluginHookContext,
   PluginLifecycleEvents,
@@ -42,7 +42,7 @@ import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
 import { Reopener, hostReload } from "./reopen";
-import { DuplicateWatch } from "./duplicates";
+import { backgroundShells, DuplicateWatch, type AgentContext, type DuplicateWatchOptions } from "./duplicates";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
@@ -109,6 +109,7 @@ const DEFAULT_PREFERENCES: Preferences = {
   moveAgentsOnDefaultChange: true,
   balanceNewAgents: false,
   paceWeeklyUsage: true,
+  reapDetachedDuplicates: true,
   showComposerPill: true,
   autoRedeem: false,
   useCredits: false,
@@ -147,6 +148,12 @@ interface AgentInfo {
   updatedAt: number;
   /** Tokens in its context window after the last turn, when Paseo knows. */
   contextTokens: number | null;
+  /**
+   * Background jobs (run_in_background shells, Monitors) Paseo knows the agent has. Paseo reports a
+   * count only once it has recorded some, so none reported is none. A reload closes the provider
+   * process and kills them all.
+   */
+  backgroundJobs: number;
 }
 
 type ReopenOutcome = "reopened" | "deferred" | "closed" | "failed";
@@ -215,22 +222,48 @@ export class Service {
   private started = false;
   private starting: Promise<void> | null = null;
 
+  private readonly duplicateWatch: DuplicateWatch | null;
+  /** Bash-tool shells under the agent's provider process (Linux); none under tests, which never read real processes. */
+  private readonly countShells: (agentId: string) => Promise<number> = process.env.VITEST ? async () => 0 : (agentId) => backgroundShells(agentId);
+
   constructor(
     private readonly adapters: Record<Family, FamilyAdapter>,
     private readonly store = new StateStore(),
     private readonly families = new FamilyResolver(),
     private readonly reopener = new Reopener(),
     /**
-     * Read-only: agents with more than one provider process, logged and captured once each. Off under
-     * tests, which must never scan the machine's real processes or write captures.
+     * Agents with more than one provider process: logged and captured once each, and detached ones
+     * stopped while `reapDetachedDuplicates` is on. `undefined` builds the real one, except under
+     * tests, which must never scan the machine's real processes, signal them, or write captures.
      */
-    private readonly duplicateWatch: DuplicateWatch | null = process.env.VITEST ? null : new DuplicateWatch(),
+    duplicateWatch?: DuplicateWatch | null,
   ) {
+    this.duplicateWatch = duplicateWatch !== undefined ? duplicateWatch : process.env.VITEST ? null : this.newDuplicateWatch();
     this.continuations = new CodexContinuations(store);
   }
 
   setPreferences(prefs: Preferences): void {
     this.prefs = prefs;
+  }
+
+  /** The real watch: the preference decides on stopping, and an agent's state comes fresh from Paseo. */
+  newDuplicateWatch(options: Omit<DuplicateWatchOptions, "reap" | "context"> = {}): DuplicateWatch {
+    return new DuplicateWatch({
+      ...options,
+      reap: () => this.prefs.reapDetachedDuplicates,
+      context: (agentId) => this.duplicateContext(agentId),
+    });
+  }
+
+  /** Busy unless Paseo confirms the agent is between turns with nothing asked; home from its zerosub session. */
+  private async duplicateContext(agentId: string): Promise<AgentContext> {
+    const info = this.paseo ? await agentInfo(this.paseo, agentId) : null;
+    const busy = !info || !settled(info.status) || info.pendingPermissions > 0;
+    const state = await this.store.read();
+    const session = state.sessions[agentId];
+    const account = session ? state.accounts.find((entry) => entry.id === session.accountId) : undefined;
+    const home = account ? (account.home ? basename(account.home) : null) : undefined;
+    return { busy, home };
   }
 
   /** Remember the plugin's SDK connection for background work (cleanup, failover). */
@@ -363,6 +396,7 @@ export class Service {
           pendingPermissions: agent.pendingPermissions,
           updatedAt: agent.updatedAt,
           contextTokens: agent.contextTokens,
+          backgroundJobs: agent.backgroundJobs,
           runningOn: state.sessions[agent.id]?.accountId,
         }));
       const move = planPaceMove({
@@ -1373,6 +1407,8 @@ export class Service {
     agentId: string,
     row: SwitchRow | null = null,
     settle = false,
+    /** The user asked for this very agent's move: it happens even if that stops its background jobs. */
+    explicit = false,
   ): Promise<ReopenOutcome> {
     let info = await agentInfo(paseo, agentId);
     for (let attempt = 0; settle && info && attempt < 20 && (info.status === "running" || info.status === "initializing"); attempt += 1) {
@@ -1397,6 +1433,17 @@ export class Service {
         });
       }
       return "closed";
+    }
+    // A reload closes the provider process, and its background jobs with it. Invariant: zerosub never
+    // kills an agent's background work to move it; the move waits for a turn end with no jobs left.
+    const jobs = Math.max(info.backgroundJobs, await this.countShells(agentId).catch(() => 0));
+    if (jobs > 0) {
+      if (!explicit) {
+        console.log(`[ZeroSub] ${agentId} has ${jobs} background job(s); its account move waits until they're done`);
+        this.deferred.set(agentId, row);
+        return "deferred";
+      }
+      console.warn(`[ZeroSub] moving ${agentId} as asked: its ${jobs} background job(s) stop with its session`);
     }
     const before = (await this.store.read()).sessions[agentId];
     const result = await this.reopener.reopen(agentId, paseo);
@@ -1450,7 +1497,7 @@ export class Service {
         detail: null,
         at: new Date().toISOString(),
       };
-      const outcome = await this.reopenAgent(paseo, agentId, row);
+      const outcome = await this.reopenAgent(paseo, agentId, row, false, reason === "manual");
       if (outcome === "reopened") {
         summary.reopened.push(agentId);
         await this.appendRow(paseo, agentId, await this.landed(row, agentId));
@@ -2160,6 +2207,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     pendingPermissions: agent.pendingPermissions?.length ?? 0,
     updatedAt: Date.parse(agent.updatedAt ?? "") || 0,
     contextTokens: agent.lastUsage?.contextWindowUsedTokens ?? null,
+    backgroundJobs: (agent as { backgroundWork?: { count?: number } }).backgroundWork?.count ?? 0,
   };
 }
 

@@ -4,6 +4,7 @@ import {
   ON_PACE_SCORE,
   PACE,
   paceBindingsToDrop,
+  paceCanTouch,
   pacePick,
   paceScore,
   planPaceMove,
@@ -78,10 +79,18 @@ function agent(id: string, partial: Partial<PaceAgent> = {}): PaceAgent {
     pendingPermissions: 0,
     updatedAt: NOW - 30 * 60_000,
     contextTokens: 50_000,
+    backgroundJobs: 0,
     runningOn: MAIN,
     ...partial,
   };
 }
+
+describe("background work", () => {
+  it("an agent with background jobs is never touchable: a move would kill them", () => {
+    expect(paceCanTouch(agent("a"), NOW)).toBe(true);
+    expect(paceCanTouch(agent("a", { backgroundJobs: 1 }), NOW)).toBe(false);
+  });
+});
 
 function plan(partial: Partial<PlanInput> = {}) {
   return planPaceMove({

@@ -6,11 +6,12 @@ import { createInterface } from "node:readline";
 import { dataDir, paseoHome } from "./paths";
 
 /**
- * Read-only watch for agents with more than one provider process: an orphaned process keeps writing
- * the same transcript and holds memory. Exists to catch the next occurrence while the daemon's logs
- * still cover it.
+ * Watch for agents with more than one provider process: an orphaned process keeps writing the same
+ * transcript and holds memory (getpaseo/paseo#9408). Logs and captures each occurrence while the
+ * daemon's logs still cover it, and stops detached ones (see `DuplicateWatch`).
  *
- * It never kills or signals anything. It reads a process's environment only after its command line
+ * It only ever signals a duplicate that looks detached (`detachedCandidates`), and only with the
+ * `reapDetachedDuplicates` preference on. It reads a process's environment only after its command line
  * shows it's a provider process, and keeps nothing from it but PASEO_AGENT_ID and CLAUDE_CONFIG_DIR.
  */
 
@@ -25,6 +26,10 @@ export interface ProviderProcess {
   resume: string | null;
   /** ISO time the process started, when /proc says. */
   startedAt: string | null;
+  /** Start time in clock ticks since boot: orders processes, and tells a reused pid apart. */
+  startTicks: number;
+  /** CPU time used so far (user + system), in clock ticks. */
+  cpuTicks: number;
 }
 
 export interface Duplicate {
@@ -86,6 +91,7 @@ export async function scanProviderProcesses(procRoot = "/proc"): Promise<Provide
       const stat = await readFile(join(dir, "stat"), "utf8");
       const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
       const ticks = Number(fields[19]);
+      const cpu = Number(fields[11]) + Number(fields[12]);
       found.push({
         pid: Number(name),
         ppid: Number(fields[1]),
@@ -93,6 +99,8 @@ export async function scanProviderProcesses(procRoot = "/proc"): Promise<Provide
         home: env.CLAUDE_CONFIG_DIR ? basename(env.CLAUDE_CONFIG_DIR) : null,
         resume: resumeOf(argv),
         startedAt: boot !== null && Number.isFinite(ticks) ? new Date(boot + (ticks / CLOCK_TICKS) * 1000).toISOString() : null,
+        startTicks: Number.isFinite(ticks) ? ticks : 0,
+        cpuTicks: Number.isFinite(cpu) ? cpu : 0,
       });
     } catch {
       // Gone, or not ours to read: skip it.
@@ -114,7 +122,7 @@ export function findDuplicates(processes: readonly ProviderProcess[]): Duplicate
     .filter(([, list]) => list.length > 1)
     .map(([agentId, list]) => ({
       agentId,
-      processes: [...list].sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? "") || a.pid - b.pid),
+      processes: [...list].sort((a, b) => a.startTicks - b.startTicks || a.pid - b.pid),
     }));
 }
 
@@ -193,19 +201,81 @@ export async function captureDaemonLogs(
   return path;
 }
 
+/** What the watch needs to know about an agent before it may stop one of its processes. */
+export interface AgentContext {
+  /** Mid-turn or waiting on the user, or its status couldn't be read: never act then. */
+  busy: boolean;
+  /** Last path segment of the home of the account its session runs on; `null` the CLI login; `undefined` unknown. */
+  home: string | null | undefined;
+}
+
+export const REAP = {
+  /** A process has to look detached on checks at least this far apart before it's stopped. */
+  confirmMs: 55_000,
+  /** With no account mismatch to go by, it must also have been idle this long. */
+  idleMs: 10 * 60_000,
+  /**
+   * Idle: under this share of one core between checks. A detached Claude process still ticks (about
+   * 0.4% measured); a turn uses far more.
+   */
+  idleCpuShare: 0.01,
+  /** SIGTERM, then SIGKILL after this long if it's still the same process. */
+  killAfterMs: 10_000,
+} as const;
+
 export interface DuplicateWatchOptions {
   procRoot?: string;
   everyMs?: number;
   capture?: (duplicate: Duplicate, detectedAt: string) => Promise<string>;
   log?: (line: string) => void;
   now?: () => number;
+  /** Whether stopping detached duplicates is on (the `reapDetachedDuplicates` preference). */
+  reap?: () => boolean;
+  /** The agent's state; when it throws or isn't given, nothing is stopped. */
+  context?: (agentId: string) => Promise<AgentContext>;
+  signal?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+  /** Waits between SIGTERM and SIGKILL. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
-/** Checks at most once a `everyMs`; logs and captures each new set of duplicate processes once. */
+/**
+ * Which of an agent's duplicate processes look detached: never the newest (the one the daemon tracks:
+ * a reload or close ends only it), and only one whose home isn't the account the agent now runs on, or
+ * that has been idle (under `REAP.idleCpuShare` of a core) for `REAP.idleMs`.
+ */
+export function detachedCandidates(
+  duplicate: Duplicate,
+  home: string | null | undefined,
+  idleSince: (entry: ProviderProcess) => number,
+  now: number,
+): Array<{ entry: ProviderProcess; why: string }> {
+  const older = duplicate.processes.slice(0, -1);
+  const out: Array<{ entry: ProviderProcess; why: string }> = [];
+  for (const entry of older) {
+    if (home !== undefined && entry.home !== home) {
+      out.push({ entry, why: `its home (${entry.home ?? "CLI login"}) isn't the agent's account (${home ?? "CLI login"})` });
+    } else if (now - idleSince(entry) >= REAP.idleMs) {
+      out.push({ entry, why: `it has been idle (under 1% CPU) for ${Math.round((now - idleSince(entry)) / 60_000)} min` });
+    }
+  }
+  return out;
+}
+
+/**
+ * Checks at most once a `everyMs`; logs and captures each new set of duplicate processes once. With
+ * reaping on, stops a process that has looked detached on two checks (`detachedCandidates`), with
+ * SIGTERM and then SIGKILL, after logging it and copying the daemon log. Invariant: an agent never
+ * keeps a detached duplicate whose home differs from its account for more than about two minutes.
+ */
 export class DuplicateWatch {
   private lastAt = Number.NEGATIVE_INFINITY;
   private seen = new Map<string, string>();
   private current: Array<Duplicate & { since: string }> = [];
+  /** pid:startTicks -> CPU ticks at the last check, and since when it has been idle. */
+  private cpu = new Map<string, { ticks: number; at: number; idleSince: number }>();
+  /** pid:startTicks -> when it first looked detached. */
+  private suspect = new Map<string, number>();
+  private stopping = new Set<string>();
 
   constructor(private readonly options: DuplicateWatchOptions = {}) {}
 
@@ -219,8 +289,11 @@ export class DuplicateWatch {
     const now = (this.options.now ?? Date.now)();
     if (now - this.lastAt < (this.options.everyMs ?? 60_000)) return;
     this.lastAt = now;
-    const found = findDuplicates(await scanProviderProcesses(this.options.procRoot));
+    const processes = await scanProviderProcesses(this.options.procRoot);
+    this.trackCpu(processes, now);
+    const found = findDuplicates(processes);
     const log = this.options.log ?? ((line: string) => console.log(line));
+    const capture = this.options.capture ?? ((dup: Duplicate, at: string) => captureDaemonLogs(dup, at));
     const next = new Map<string, string>();
     this.current = [];
     for (const duplicate of found) {
@@ -229,10 +302,117 @@ export class DuplicateWatch {
       next.set(key, since);
       this.current.push({ ...duplicate, since });
       if (this.seen.has(key)) continue;
-      const capture = this.options.capture ?? ((dup, at) => captureDaemonLogs(dup, at));
       const saved = await capture(duplicate, since).then((path) => `log copy in ${path}`, (error: unknown) => `log copy failed: ${String(error)}`);
       log(`[ZeroSub] agent ${duplicate.agentId} has ${duplicate.processes.length} provider processes: ${duplicate.processes.map(describeProcess).join("; ")}. Nothing was stopped; ${saved}`);
     }
     this.seen = next;
+    await this.reapDetached(found, now, log, capture);
   }
+
+  private trackCpu(processes: readonly ProviderProcess[], now: number): void {
+    const next = new Map<string, { ticks: number; at: number; idleSince: number }>();
+    for (const entry of processes) {
+      const id = identity(entry);
+      const before = this.cpu.get(id);
+      const elapsedTicks = before ? ((now - before.at) / 1000) * CLOCK_TICKS : 0;
+      const busy = !before || entry.cpuTicks - before.ticks > REAP.idleCpuShare * elapsedTicks;
+      next.set(id, { ticks: entry.cpuTicks, at: now, idleSince: busy ? now : before.idleSince });
+    }
+    this.cpu = next;
+  }
+
+  private async reapDetached(
+    found: readonly Duplicate[],
+    now: number,
+    log: (line: string) => void,
+    capture: (duplicate: Duplicate, at: string) => Promise<string>,
+  ): Promise<void> {
+    const suspects = new Map<string, number>();
+    if (this.options.reap?.() && this.options.context) {
+      for (const duplicate of found) {
+        const context = await this.options.context(duplicate.agentId).catch(() => null);
+        if (!context || context.busy) {
+          // Can't tell, or mid-turn: keep what was suspected, act on a later check.
+          for (const entry of duplicate.processes) {
+            const at = this.suspect.get(identity(entry));
+            if (at !== undefined) suspects.set(identity(entry), at);
+          }
+          continue;
+        }
+        const idleSince = (entry: ProviderProcess) => this.cpu.get(identity(entry))?.idleSince ?? now;
+        for (const { entry, why } of detachedCandidates(duplicate, context.home, idleSince, now)) {
+          const id = identity(entry);
+          const firstAt = this.suspect.get(id) ?? now;
+          suspects.set(id, firstAt);
+          if (now - firstAt < REAP.confirmMs || this.stopping.has(id)) continue;
+          const at = new Date(now).toISOString();
+          const saved = await capture(duplicate, at).then((path) => `log copy in ${path}`, (error: unknown) => `log copy failed: ${String(error)}`);
+          log(`[ZeroSub] stopping detached duplicate of agent ${duplicate.agentId}: ${describeProcess(entry)}, because ${why}; keeping the newest, pid ${duplicate.processes.at(-1)!.pid}. ${saved}`);
+          this.stopping.add(id);
+          void this.stop(entry, log).finally(() => this.stopping.delete(id));
+        }
+      }
+    }
+    this.suspect = suspects;
+  }
+
+  /** SIGTERM, then SIGKILL if the very same process is still there; never a pid that was reused. */
+  private async stop(entry: ProviderProcess, log: (line: string) => void): Promise<void> {
+    const signal = this.options.signal ?? ((pid: number, sig: "SIGTERM" | "SIGKILL") => process.kill(pid, sig));
+    const sleep = this.options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms).unref?.()));
+    if (!(await this.sameProcess(entry))) return;
+    try {
+      signal(entry.pid, "SIGTERM");
+    } catch (error) {
+      log(`[ZeroSub] couldn't stop pid ${entry.pid}: ${String(error)}`);
+      return;
+    }
+    await sleep(REAP.killAfterMs);
+    if (!(await this.sameProcess(entry))) {
+      log(`[ZeroSub] detached duplicate pid ${entry.pid} of agent ${entry.agentId} has exited`);
+      return;
+    }
+    try {
+      signal(entry.pid, "SIGKILL");
+      log(`[ZeroSub] detached duplicate pid ${entry.pid} of agent ${entry.agentId} ignored SIGTERM; sent SIGKILL`);
+    } catch (error) {
+      log(`[ZeroSub] couldn't kill pid ${entry.pid}: ${String(error)}`);
+    }
+  }
+
+  private async sameProcess(entry: ProviderProcess): Promise<boolean> {
+    const now = await scanProviderProcesses(this.options.procRoot).catch(() => []);
+    return now.some((other) => other.pid === entry.pid && other.startTicks === entry.startTicks && other.agentId === entry.agentId);
+  }
+}
+
+function identity(entry: ProviderProcess): string {
+  return `${entry.pid}:${entry.startTicks}`;
+}
+
+/** A Claude Code Bash-tool shell (as `background-busy` recognizes them); MCP servers and hooks aren't. */
+const BASH_TOOL_SHELL = /^\/bin\/(?:ba|z)?sh -c source \S*shell-snapshots\/snapshot-/;
+
+/**
+ * Bash-tool shells running under the agent's newest provider process. On an agent between turns each
+ * one is a background job a reload would kill. Read-only; 0 off Linux or when nothing can be read.
+ */
+export async function backgroundShells(agentId: string, procRoot = "/proc"): Promise<number> {
+  if (process.platform !== "linux" && procRoot === "/proc") return 0;
+  const own = (await scanProviderProcesses(procRoot)).filter((entry) => entry.agentId === agentId);
+  const newest = own.sort((a, b) => a.startTicks - b.startTicks || a.pid - b.pid).at(-1);
+  if (!newest) return 0;
+  let shells = 0;
+  for (const name of await readdir(procRoot).catch(() => [] as string[])) {
+    if (!/^\d+$/.test(name)) continue;
+    try {
+      const stat = await readFile(join(procRoot, name, "stat"), "utf8");
+      if (Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) !== newest.pid) continue;
+      const argv = (await readFile(join(procRoot, name, "cmdline"), "utf8")).split("\0").filter(Boolean);
+      if (BASH_TOOL_SHELL.test(argv.join(" "))) shells += 1;
+    } catch {
+      // Gone: not a job any more.
+    }
+  }
+  return shells;
 }

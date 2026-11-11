@@ -14,6 +14,13 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
   GitHub release. It needs Tom's explicit OK for that exact version first. Ask him, and quote his OK in the release
   commit body.
 - Nothing is ever published or opened against `kapybara-org/zerosub` without Tom.
+- **Release notes (Tom's rule, 2026-11-11):** every GitHub release, beta or not, shows clean notes in the same format
+  as Tom's other plugins (reference: `tomgrin10/paseo-smart-session`, AGENTS.md "Create a release" and
+  `scripts/release-notes.mjs`). Title "ZeroSub vX.Y.Z"; body `## What's new`, then `## Install`, then one line on the
+  verification it passed. A beta lists its own changes; an rc or stable gets a curated summary grouped by what a user
+  gets (biggest first, plus `### Upgrading from X.Y` when needed), never a dump of commits. No empty or boilerplate
+  bodies. In-app What's new popups stay major-only. The fork has no GitHub releases today (`-pace.N` builds are
+  local tarballs), so this applies from the first one Tom approves.
 
 ## Working rules
 

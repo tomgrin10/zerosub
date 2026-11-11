@@ -62,6 +62,11 @@ type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
 const FAMILIES: readonly Family[] = ["claude", "codex"];
+/**
+ * One-turn helper agents another plugin creates and archives right away, by label and value. Their
+ * account choice is over once they're archived, so their bindings are pruned then, not kept forever.
+ */
+const ONE_SHOT_HELPERS: ReadonlyArray<readonly [label: string, value: string]> = [["smart-session.helper", "publish-as"]];
 const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex" };
 const OTHER_FAMILY: Record<Family, Family> = { claude: "codex", codex: "claude" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
@@ -129,6 +134,8 @@ interface AgentInfo {
   title: string | null;
   /** The agent this one carries on from, when ZeroSub started it as a continuation. */
   continuedFrom: string | null;
+  /** A one-shot helper another plugin made (see ONE_SHOT_HELPERS): its binding goes once it's archived. */
+  oneShotHelper: boolean;
   /** Permission prompts waiting on the user. */
   pendingPermissions: number;
   /** When Paseo last changed the agent (status, turn, title), epoch ms. */
@@ -431,8 +438,11 @@ export class Service {
     const known = new Set(agents.map((agent) => agent.id));
     const state = await this.store.read();
     const old = (at: string) => now - (Date.parse(at) || 0) > PRUNE_MS;
-    const staleSessions = Object.entries(state.sessions).filter(([id, session]) => !known.has(id) && old(session.openedAt));
-    const staleBindings = Object.entries(state.bindings).filter(([id, binding]) => !known.has(id) && old(binding.at));
+    // An archived one-shot helper's binding is spent: it never runs again. Only a state write, so
+    // nothing is woken; an archived agent that isn't such a helper keeps its pin for when it's back.
+    const spent = new Set(agents.filter((agent) => agent.archived && agent.oneShotHelper).map((agent) => agent.id));
+    const staleSessions = Object.entries(state.sessions).filter(([id, session]) => (!known.has(id) && old(session.openedAt)) || spent.has(id));
+    const staleBindings = Object.entries(state.bindings).filter(([id, binding]) => (!known.has(id) && old(binding.at)) || spent.has(id));
     const active = new Set(agents.filter((agent) => !agent.archived).map((agent) => agent.id));
     // A hand-off that may have sent its prompt stays on record while its tab could come back. A
     // failed creation sent nothing, so it doesn't keep the task's record alive.
@@ -2110,6 +2120,7 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     hasHistory: Boolean(agent.lastUserMessageAt),
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
+    oneShotHelper: ONE_SHOT_HELPERS.some(([label, value]) => agent.labels?.[label] === value),
     pendingPermissions: agent.pendingPermissions?.length ?? 0,
     updatedAt: Date.parse(agent.updatedAt ?? "") || 0,
     contextTokens: agent.lastUsage?.contextWindowUsedTokens ?? null,

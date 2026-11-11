@@ -84,6 +84,18 @@ export const ContinuationChainSchema = z.object({
 });
 export type ContinuationChain = z.infer<typeof ContinuationChainSchema>;
 
+/**
+ * What paces moves has to outlive the process: a plugin reload must not let pacing speed up, or move
+ * an agent the user just re-routed by hand.
+ */
+export const PaceRecordSchema = z.object({
+  /** The last pace move, either direction. */
+  lastMoveAt: z.string().nullable().default(null),
+  /** Agents the user re-routed by hand, and when; pruned once their cooldown is over. */
+  routedByHand: z.record(z.string(), z.string()).default({}),
+});
+export type PaceRecord = z.infer<typeof PaceRecordSchema>;
+
 export const StoredStateSchema = z.object({
   version: z.literal(1).default(1),
   accounts: z.array(StoredAccountSchema).default([]),
@@ -95,6 +107,7 @@ export const StoredStateSchema = z.object({
   /** Which account each agent's live provider session was opened with. */
   sessions: z.record(z.string(), LiveSessionSchema).default({}),
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
+  pace: PaceRecordSchema.default({ lastMoveAt: null, routedByHand: {} }),
 });
 export type StoredState = z.infer<typeof StoredStateSchema>;
 
@@ -139,6 +152,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       bindings: records(BindingSchema, source.bindings),
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
+      pace: keep(PaceRecordSchema, source.pace ?? {}) ?? { lastMoveAt: null, routedByHand: {} },
     },
     dropped: true,
   };

@@ -194,11 +194,8 @@ export class Service {
   private readonly browserSignIn = canSignInWithBrowser();
   private agentCache: { at: number; agents: Promise<AgentInfo[]> } | null = null;
   private lastPrune = 0;
-  /** The last pace move (either direction) and the last look for one, epoch ms. */
-  private lastPaceMoveAt = 0;
+  /** The last look for a pace move, epoch ms. The moves themselves are timed from `state.pace`. */
   private lastPaceCheckAt = 0;
-  /** Agents the user re-routed by hand, and when: pace leaves them alone for a while. */
-  private readonly routedByHand = new Map<string, number>();
   private collecting = false;
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
@@ -355,12 +352,16 @@ export class Service {
         usageOf: (id) => this.usage.get(id),
         now,
         enabled,
-        lastMoveAt: this.lastPaceMoveAt,
-        recentlyRouted: (agentId) => this.switching.has(agentId) || now - (this.routedByHand.get(agentId) ?? 0) < PACE.agentCooldownMs,
+        lastMoveAt: Date.parse(state.pace.lastMoveAt ?? "") || 0,
+        recentlyRouted: (agentId) =>
+          this.switching.has(agentId) || now - (Date.parse(state.pace.routedByHand[agentId] ?? "") || 0) < PACE.agentCooldownMs,
       });
       if (!move) continue;
-      // Counts even if the move doesn't happen, so a failing reload can't turn into a burst.
-      this.lastPaceMoveAt = now;
+      // Recorded first, and kept even if the move doesn't happen, so neither a failing reload nor a
+      // plugin reload can turn into a burst.
+      await this.store.update((draft) => {
+        draft.pace.lastMoveAt = new Date(now).toISOString();
+      });
       await this.applyPaceMove(paseo, move, now);
       return move;
     }
@@ -1829,10 +1830,15 @@ export class Service {
       }
     }
 
-    this.routedByHand.set(agentId, Date.now());
     await this.store.update((draft) => {
-      if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date().toISOString() };
+      const now = Date.now();
+      if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date(now).toISOString() };
       else delete draft.bindings[agentId];
+      // Pace leaves a hand re-route alone for a while, across plugin reloads too.
+      for (const [id, at] of Object.entries(draft.pace.routedByHand)) {
+        if (now - (Date.parse(at) || 0) >= PACE.agentCooldownMs) delete draft.pace.routedByHand[id];
+      }
+      draft.pace.routedByHand[agentId] = new Date(now).toISOString();
     });
     return this.reconcile(paseo, "manual", [agentId]);
   }

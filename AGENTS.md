@@ -29,8 +29,13 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
 Use the script; don't run the steps by hand:
 
 ```sh
-scripts/install-vm.sh ~/paseo-harness/zerosub-pace/kapybara-zerosub-<version>.tgz
+~/paseo-harness/tools/reload-gate run zerosub -- scripts/install-vm.sh ~/paseo-harness/zerosub-pace/kapybara-zerosub-<version>.tgz
 ```
+
+Always run it through `reload-gate` (Tom's rule, 2026-11-11: at most one live plugin reload window every 30 min,
+machine-wide). Every live reload marks every live agent stale, so its next message pays a close+resume; the gate
+batches reloads into one window and sleeps until the next one. Read the header of `~/paseo-harness/tools/reload-gate`;
+bypass only with `RELOAD_GATE_BYPASS="<Tom's words>, <when>"`. Harness daemons (temp `PASEO_HOME`) are exempt.
 
 It never restarts Paseo and never touches `~/.paseo/zerosub` (accounts, homes, bindings). Two facts drive it:
 

@@ -42,6 +42,7 @@ import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
 import { Reopener, hostReload } from "./reopen";
+import { DuplicateWatch } from "./duplicates";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
@@ -219,6 +220,11 @@ export class Service {
     private readonly store = new StateStore(),
     private readonly families = new FamilyResolver(),
     private readonly reopener = new Reopener(),
+    /**
+     * Read-only: agents with more than one provider process, logged and captured once each. Off under
+     * tests, which must never scan the machine's real processes or write captures.
+     */
+    private readonly duplicateWatch: DuplicateWatch | null = process.env.VITEST ? null : new DuplicateWatch(),
   ) {
     this.continuations = new CodexContinuations(store);
   }
@@ -315,6 +321,8 @@ export class Service {
       else if (!login.finishedAt && now - Date.parse(login.view.startedAt) > LOGIN_TTL_MS) void this.cancelLogin(id);
     }
     if (this.paseo) await this.collectOrphanHomes(this.paseo);
+    // At most once a minute (the watch spaces itself); never blocks upkeep.
+    void this.duplicateWatch?.check().catch((error: unknown) => log("checking for duplicate provider processes failed", error));
     if (this.paseo && now - this.lastPaceCheckAt >= PACE_CHECK_MS) {
       this.lastPaceCheckAt = now;
       await this.pace(this.paseo).catch((error: unknown) => log("pacing weekly usage failed", error));
@@ -1672,6 +1680,11 @@ export class Service {
     }
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
+    }
+    for (const duplicate of this.duplicateWatch?.duplicates ?? []) {
+      warnings.push(
+        `Agent ${duplicate.agentId.slice(0, 8)} has ${duplicate.processes.length} provider processes (pids ${duplicate.processes.map((entry) => entry.pid).join(", ")}) since ${duplicate.since}. ZeroSub doesn't stop them; the daemon log around that time was copied for diagnosis.`,
+      );
     }
     if (!(await this.canReopen(this.paseo))) {
       warnings.push(

@@ -46,6 +46,19 @@ export const CreditsSchema = z.object({
 });
 export type Credits = z.infer<typeof CreditsSchema>;
 
+/**
+ * Pay-as-you-go usage past the plan's limits (Claude "extra usage"), as the usage response reports it.
+ * `spend` and `limit` are Claude's `used_credits` and `monthly_limit`, in its own units; `null` when
+ * the response leaves them out (ZeroSub's read asks Anthropic to skip spend, so `spend` often is).
+ */
+export const ExtraUsageSchema = z.object({
+  enabled: z.boolean(),
+  spend: z.number().nullable().default(null),
+  limit: z.number().nullable().default(null),
+  currency: z.string().nullable().default(null),
+});
+export type ExtraUsage = z.infer<typeof ExtraUsageSchema>;
+
 export const UsageSchema = z.object({
   fetchedAt: z.string(),
   windows: z.array(UsageWindowSchema),
@@ -57,6 +70,8 @@ export const UsageSchema = z.object({
   resets: ResetOfferSchema.nullable().default(null),
   /** Credits the account can spend past full windows, when the provider reports any. */
   credits: CreditsSchema.nullable().default(null),
+  /** Claude extra usage, when the usage response reports it. Read by Smart Session from usage.json. */
+  extraUsage: ExtraUsageSchema.nullable().optional(),
 });
 export type Usage = z.infer<typeof UsageSchema>;
 

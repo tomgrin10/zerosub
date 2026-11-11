@@ -96,6 +96,8 @@ const AGENT_LIST_MS = 3_000;
 const ROUTING_WAIT_MS = 5_000;
 /** How long the end of a turn waits for Paseo to page the agent's timeline. The SDK itself waits 60 s. */
 const TURN_READ_MS = 10_000;
+/** How long a new session waits to learn whether its workspace is a background one. */
+const AGENT_LOOKUP_MS = 3_000;
 /** How often upkeep looks for a pace move. Moves themselves are spaced by `PACE.moveEveryMs`. */
 const PACE_CHECK_MS = 60_000;
 
@@ -136,6 +138,8 @@ interface AgentInfo {
   continuedFrom: string | null;
   /** A one-shot helper another plugin made (see ONE_SHOT_HELPERS): its binding goes once it's archived. */
   oneShotHelper: boolean;
+  /** Created as a background agent: hidden from Paseo's lists, short-lived, never paced. */
+  background: boolean;
   /** Permission prompts waiting on the user. */
   pendingPermissions: number;
   /** When Paseo last changed the agent (status, turn, title), epoch ms. */
@@ -347,6 +351,7 @@ export class Service {
           family,
           status: agent.status,
           archived: agent.archived,
+          background: agent.background,
           pendingPermissions: agent.pendingPermissions,
           updatedAt: agent.updatedAt,
           contextTokens: agent.contextTokens,
@@ -542,6 +547,12 @@ export class Service {
     const adapter = this.adapters[family];
     const now = Date.now();
     const state = await this.store.read();
+    // Pace never places a background agent. The request doesn't say which it is, and the new agent isn't
+    // listed yet, but its workspace is: a background agent opens in a background workspace. One that
+    // can't be confirmed as foreground is routed as if pacing were off.
+    const pacing =
+      this.prefs.paceWeeklyUsage && request.reason === "create" && adapter.portable &&
+      (await this.inForegroundWorkspace(context.paseo, request.workspaceId));
     const decision = chooseAccount(state, {
       agentId: request.agentId,
       family,
@@ -549,7 +560,7 @@ export class Service {
       now,
       autoSwitch: this.prefs.autoSwitch,
       balanceNewAgents: this.prefs.balanceNewAgents,
-      paceWeeklyUsage: this.prefs.paceWeeklyUsage,
+      paceWeeklyUsage: pacing,
       portable: adapter.portable,
       usageOf: (id) => this.usage.get(id),
     });
@@ -581,6 +592,16 @@ export class Service {
       })`,
     );
     return { ...request, env: applyEnv(await adapter.env(account.home), request.env) };
+  }
+
+  /** Whether Paseo confirms, within a moment, that the workspace isn't a background one. No workspace: foreground. */
+  private async inForegroundWorkspace(paseo: PaseoApi, workspaceId: string | null | undefined): Promise<boolean> {
+    if (!workspaceId) return true;
+    const workspaces = (paseo as unknown as { workspaces?: { ref(id: string): { refresh(): Promise<unknown> } } }).workspaces;
+    if (!workspaces) return true; // A host without workspaces has no background agents either.
+    const found = await deadline(workspaces.ref(workspaceId).refresh(), AGENT_LOOKUP_MS, "workspace lookup timed out").catch(() => null);
+    if (!found || typeof found !== "object") return false;
+    return (found as { background?: boolean }).background !== true;
   }
 
   /** A turn uses the account from its first token, so a long one keeps its usage fresh too. */
@@ -2121,6 +2142,8 @@ function toAgentInfo(agent: AgentSnapshot): AgentInfo {
     title: agent.title ?? null,
     continuedFrom: agent.labels?.[CONTINUED_FROM_LABEL] ?? null,
     oneShotHelper: ONE_SHOT_HELPERS.some(([label, value]) => agent.labels?.[label] === value),
+    // Paseo 0.16 snapshots say so; older ones have no background agents.
+    background: (agent as { background?: boolean }).background === true,
     pendingPermissions: agent.pendingPermissions?.length ?? 0,
     updatedAt: Date.parse(agent.updatedAt ?? "") || 0,
     contextTokens: agent.lastUsage?.contextWindowUsedTokens ?? null,

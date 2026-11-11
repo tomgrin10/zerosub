@@ -121,6 +121,8 @@ export interface PaceAgent {
   family: Family;
   status: string;
   archived: boolean;
+  /** A background helper (another plugin's job, say): short-lived, never ours to move. */
+  background: boolean;
   /** Permission prompts waiting on the user. */
   pendingPermissions: number;
   /** When the agent last changed (Paseo's `updatedAt`), as epoch ms. */
@@ -160,11 +162,11 @@ export function paceMayMove(binding: Binding | undefined): boolean {
 
 /**
  * Open, between turns, nothing asked of the user, quiet for a few minutes but active within the last
- * few hours. Closed, archived, running, failed and dormant agents never qualify.
+ * few hours. Closed, archived, running, failed, dormant and background agents never qualify.
  */
 export function paceCanTouch(agent: PaceAgent, now: number): boolean {
   const idle = now - agent.updatedAt;
-  return !agent.archived && agent.status === "idle" && agent.pendingPermissions === 0 &&
+  return !agent.archived && !agent.background && agent.status === "idle" && agent.pendingPermissions === 0 &&
     Number.isFinite(idle) && idle >= PACE.minIdleMs && idle <= PACE.maxIdleMs;
 }
 

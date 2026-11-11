@@ -69,6 +69,7 @@ interface Listed {
   /** Minutes since the agent last changed. */
   quietFor?: number;
   contextTokens?: number;
+  background?: boolean;
 }
 
 async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, paceWeeklyUsage = true) {
@@ -96,11 +97,17 @@ async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, p
     updatedAt: new Date(Date.now() - (entry.quietFor ?? 30) * MINUTE).toISOString(),
     pendingPermissions: [],
     lastUsage: { contextWindowUsedTokens: entry.contextTokens ?? 50_000 },
+    background: entry.background ?? false,
+    workspaceId: entry.background ? `wks-bg-${entry.id}` : "wks-main",
   }));
+  // Background agents open in a background workspace of their own; the hook can only see that.
+  const workspaces = new Map<string, { id: string; background: boolean }>([["wks-main", { id: "wks-main", background: false }]]);
+  for (const agent of agents) if (agent.background) workspaces.set(agent.workspaceId, { id: agent.workspaceId, background: true });
   const rows: Array<{ agentId: string; row: SwitchRow }> = [];
   const lists: Array<boolean> = [];
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
+    workspaces: { ref: (id: string) => ({ refresh: async () => workspaces.get(id) ?? null }) },
     agents: {
       list: async (options: { filter?: { includeArchived?: boolean } } = {}) => {
         lists.push(Boolean(options.filter?.includeArchived));
@@ -211,6 +218,35 @@ describe("pacing weekly usage", () => {
     expect(state.bindings["idle-0"]).toMatchObject({ accountId: SEAT, source: "pace" });
     expect(state.sessions["idle-0"]?.accountId).toBe(SEAT);
     expect(rows[0]).toMatchObject({ agentId: "idle-0", row: { reason: "pace", from: "tom.gringauz", to: "claude-seat-1" } });
+  });
+
+  it("never places or moves a background agent", async () => {
+    const { service, paseo, reopened, store } = await setUp([
+      { id: "helper", background: true },
+      { id: "job", background: true },
+      { id: "worker" },
+    ]);
+    const open = (agentId: string, workspaceId: string | null) =>
+      service.onSessionOpen({ agentId, workspaceId, provider: "claude", reason: "create", purpose: "interactive", env: {} } as never, { paseo } as never);
+    await open("helper", "wks-bg-helper");
+    await open("worker", "wks-main");
+    let state = await store.read();
+    // Yesterday's numbers send new work to the seat, but not a background agent.
+    expect(state.bindings.helper).toBeUndefined();
+    expect(state.sessions.helper?.accountId).toBe(MAIN);
+    expect(state.bindings.worker).toMatchObject({ accountId: SEAT, source: "pace" });
+    // No workspace at all (an older host): nothing says background, so it's paced.
+    await open("solo", null);
+    expect((await store.read()).bindings.solo).toMatchObject({ accountId: SEAT, source: "pace" });
+    // A workspace Paseo can't find (so can't confirm as foreground) routes as if pacing were off.
+    await open("unknown", "wks-gone");
+    state = await store.read();
+    expect(state.bindings.unknown).toBeUndefined();
+
+    reopened.length = 0;
+    await run(service, paseo, reopened, 60);
+    expect(reopened).not.toContain("job");
+    expect(reopened).not.toContain("helper");
   });
 
   it("never touches closed, archived, running, dormant or manually pinned agents", async () => {

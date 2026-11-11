@@ -41,7 +41,7 @@ import { turnRows } from "./limits";
 import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
-import { Reopener } from "./reopen";
+import { Reopener, hostReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
@@ -1359,7 +1359,7 @@ export class Service {
       return "closed";
     }
     const before = (await this.store.read()).sessions[agentId];
-    const result = await this.reopener.reopen(agentId);
+    const result = await this.reopener.reopen(agentId, paseo);
     if (!result.ok) {
       console.warn(`[ZeroSub] could not reopen ${agentId}: ${result.error}`);
       // Paseo asks for the new session's environment before it closes the old one, so a failed reload
@@ -1593,11 +1593,16 @@ export class Service {
       agents: routes,
       logins: [...this.logins.values()].map((login) => login.view),
       providers: families,
-      canReopen: (await this.reopener.locate()) !== null,
+      canReopen: await this.canReopen(paseo),
       browserSignIn: this.browserSignIn,
       showComposerPill: this.prefs.showComposerPill,
       warnings: await this.warnings(),
     };
+  }
+
+  /** Whether agents can be reopened right away: by the host itself, or through the CLI. */
+  private async canReopen(paseo: PaseoApi | null): Promise<boolean> {
+    return hostReload(paseo, "") !== null || (await this.reopener.locate()) !== null;
   }
 
   /** Agents with a live session: the given ones (looked up fresh), or every one. */
@@ -1636,7 +1641,7 @@ export class Service {
     if (process.env.CODEX_ACCESS_TOKEN) {
       warnings.push("The daemon's environment sets CODEX_ACCESS_TOKEN. Codex agents on your CLI login use it instead of a ChatGPT sign-in.");
     }
-    if ((await this.reopener.locate()) === null) {
+    if (!(await this.canReopen(this.paseo))) {
       warnings.push(
         "Paseo's command-line tool wasn't found, so running agents change accounts the next time their session starts instead of right away.",
       );
@@ -2116,12 +2121,33 @@ async function agentInfo(paseo: PaseoApi, agentId: string): Promise<AgentInfo | 
 
 const MAX_PAGES = 100;
 
+/**
+ * Every agent, background ones included: Paseo leaves those out of its lists unless asked, and an
+ * agent missing from the list would look gone (its binding pruned) and couldn't be moved. A host
+ * that can't list background agents gets the plain list, marked incomplete so nothing in it is taken
+ * for gone.
+ */
 async function listAgents(paseo: PaseoApi, includeArchived: boolean): Promise<{ agents: AgentInfo[]; complete: boolean }> {
+  try {
+    return await pageAgents(paseo, includeArchived, true);
+  } catch (error) {
+    if (!/background/i.test(describe(error))) throw error;
+  }
+  const result = await pageAgents(paseo, includeArchived, false);
+  return { ...result, complete: false };
+}
+
+async function pageAgents(
+  paseo: PaseoApi,
+  includeArchived: boolean,
+  includeBackground: boolean,
+): Promise<{ agents: AgentInfo[]; complete: boolean }> {
   const agents: AgentInfo[] = [];
   let cursor: string | undefined;
+  const filter = { ...(includeArchived ? { includeArchived: true } : {}), ...(includeBackground ? { includeBackground: true } : {}) };
   for (let page = 0; page < MAX_PAGES; page += 1) {
     const result = await paseo.agents.list({
-      ...(includeArchived ? { filter: { includeArchived: true } } : {}),
+      ...(Object.keys(filter).length > 0 ? { filter: filter as { includeArchived?: boolean } } : {}),
       page: { limit: 200, ...(cursor ? { cursor } : {}) },
     });
     for (const { agent } of result.entries) agents.push(toAgentInfo(agent));

@@ -132,10 +132,34 @@ async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, p
       },
     } as unknown as Reopener,
   );
+  const make = (): Service => {
+    const next: Service = new Service(
+      { claude: adapter(), codex: { ...adapter(), family: "codex", portable: false } as FamilyAdapter },
+      new StateStore(join(root, "state.json")),
+      { resolve: async () => ({ claude: "claude" as const }) } as unknown as FamilyResolver,
+      {
+        locate: async () => "/usr/local/bin/paseo",
+        reopen: async (id: string) => {
+          reopened.push(id);
+          await next.onSessionOpen({ agentId: id, provider: "claude", reason: "refresh", purpose: "interactive", env: {} } as never, context);
+          return { ok: true as const };
+        },
+      } as unknown as Reopener,
+    );
+    next.setPreferences(preferences.schema.parse({ paceWeeklyUsage }));
+    return next;
+  };
   service.setPreferences(preferences.schema.parse({ paceWeeklyUsage }));
   await service.refreshUsage(MAIN, true);
   await service.refreshUsage(SEAT, true);
-  return { service, store, paseo: paseo as never, reopened, rows };
+  /** The plugin reloaded: a new process with nothing in memory, over the same state file. */
+  const reload = async (): Promise<Service> => {
+    const next = make();
+    await next.refreshUsage(MAIN, true);
+    await next.refreshUsage(SEAT, true);
+    return next;
+  };
+  return { service, store, paseo: paseo as never, reopened, rows, reload };
 }
 
 /** Runs pace once a minute for `minutes` simulated minutes; returns when each reload happened. */
@@ -151,6 +175,28 @@ async function run(service: Service, paseo: never, reopened: string[], minutes: 
 }
 
 describe("pacing weekly usage", () => {
+  it("doesn't speed up when the plugin reloads: the last move and hand re-routes outlive the process", async () => {
+    const listed = Array.from({ length: 5 }, (_, index) => ({ id: `idle-${index}`, contextTokens: 10_000 + index }));
+    const { service, paseo, reopened, reload } = await setUp(listed);
+    const start = Date.now();
+    await service.pace(paseo, start);
+    expect(reopened).toHaveLength(1);
+    // The user sends the next-cheapest agent back to the default by hand.
+    await service.setAgentAccount(paseo, "idle-1", null);
+    reopened.length = 0;
+
+    // Reloaded a minute later: still inside the interval, so no move.
+    let fresh = await reload();
+    await fresh.pace(paseo, start + 60_000);
+    expect(reopened).toEqual([]);
+
+    // Reloaded again once the interval is over: one move, and not the agent the user re-routed.
+    fresh = await reload();
+    await fresh.pace(paseo, start + PACE.moveEveryMs);
+    expect(reopened).toEqual(["idle-2"]);
+  });
+
+
   it("never reloads agents in bulk: twenty idle agents move one per interval", async () => {
     const listed = Array.from({ length: 20 }, (_, index) => ({ id: `idle-${index}`, contextTokens: 10_000 + index }));
     const { service, paseo, reopened, rows, store } = await setUp(listed);

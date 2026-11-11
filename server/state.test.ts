@@ -2,7 +2,7 @@ import { chmod, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { StateStore, salvageState } from "./state";
+import { StateStore, StoredStateSchema, salvageState } from "./state";
 
 let dir: string;
 
@@ -59,5 +59,19 @@ describe("StateStore", () => {
     await expect(store.update(() => undefined)).rejects.toThrow();
     await chmod(path, 0o600);
     expect(JSON.parse(await readFile(path, "utf8")).accounts).toHaveLength(1);
+  });
+});
+
+describe("the pace record", () => {
+  it("defaults for a registry saved before it existed, and a bad one only resets itself", () => {
+    expect(StoredStateSchema.parse({}).pace).toEqual({ lastMoveAt: null, routedByHand: {} });
+    const { state, dropped } = salvageState({
+      accounts: [],
+      bindings: { a: { accountId: "x", source: "pace", at: "2026-11-11T00:00:00.000Z" } },
+      pace: { lastMoveAt: 42 },
+    });
+    expect(dropped).toBe(true);
+    expect(state.pace).toEqual({ lastMoveAt: null, routedByHand: {} });
+    expect(state.bindings.a?.source).toBe("pace");
   });
 });

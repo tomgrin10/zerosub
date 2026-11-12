@@ -33,8 +33,12 @@ export function isUsable(account: StoredAccount, now: number): boolean {
  * Lower is better. Unknown usage ranks in the middle so a known-quiet account wins over a mystery.
  * A full window of one model only, such as "Weekly · Opus", leaves the account its room for the rest.
  */
-export function headroomScore(usage: Usage | null | undefined): number {
-  const peak = usage ? accountPeak(usage.windows) : null;
+export function headroomScore(usage: Usage | null | undefined, now = Date.now()): number {
+  // A window whose reset has passed since the reading starts again empty: an account that just
+  // reset ranks by what is left, not by the full window its last reading showed.
+  const windows = usage?.windows.map((window) =>
+    window.resetsAt && Date.parse(window.resetsAt) <= now ? { ...window, usedPercent: 0 } : window);
+  const peak = windows ? accountPeak(windows) : null;
   return peak ? peak.usedPercent : 50;
 }
 
@@ -68,7 +72,7 @@ export function mostAvailable(
   );
   const rank = (account: StoredAccount) => [
     fiveHourGated(usageOf(account.id), now) ? 1 : 0,
-    headroomScore(usageOf(account.id)),
+    headroomScore(usageOf(account.id), now),
     account.id === preferred ? 0 : 1,
     account.kind === "main" ? 0 : 1,
     Date.parse(account.createdAt) || 0,

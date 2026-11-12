@@ -1232,6 +1232,8 @@ export class Service {
           !agent.archived &&
           // Closed (dormant) agents route themselves when they next open; never wake one.
           isLive(agent.status) &&
+          // Another plugin's one-shot helper (Smart Session's publish-as) is pinned to its account on purpose and short-lived.
+          !agent.oneShotHelper &&
           families[agent.provider] === family &&
           this.runningOn(state, agent.id, family) === accountId,
       )

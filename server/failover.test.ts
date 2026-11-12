@@ -1379,6 +1379,15 @@ describe("an account a usage reading finds full (2026-11-12: Extra usage on, so 
     expect(nowhere.reopened).toEqual([]);
   });
 
+  it("leaves another plugin's one-shot helper on the account it was pinned to", async () => {
+    const { service, reopened, paseo, agent } = await setUp(state(), unused, { usage: fullFiveHours });
+    await openOn(service, paseo);
+    (agent as Record<string, unknown>).labels = { "smart-session.helper": "publish-as" };
+    await service.refreshUsage(MAIN, true);
+    await service.moveOffOut(MAIN);
+    expect(reopened).toEqual([]);
+  });
+
   it("never wakes a closed agent to move it", async () => {
     const { service, reopened, paseo, agent } = await setUp(state(), unused, { usage: fullFiveHours });
     await openOn(service, paseo);

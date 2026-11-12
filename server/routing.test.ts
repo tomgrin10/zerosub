@@ -174,7 +174,8 @@ describe("chooseAccount", () => {
         ...base, family: "codex", portable: false, balanceNewAgents: true, reason: "create",
         usageOf: (id) => reading(id === soon.id),
       });
-      expect(decision?.account.id).toBe(later.id);
+      // Past its reset, the near window starts again empty: by headroom it is then the roomier one.
+      expect(decision?.account.id).toBe(condition === "past-reset" ? soon.id : later.id);
       expect(decision?.bind?.selectionReason).toBe("headroom");
     },
   );
@@ -346,6 +347,10 @@ describe("headroom", () => {
     expect(headroomScore(opusFull)).toBe(10);
     expect(headroomScore(reading([{ id: "primary", label: "5h", usedPercent: 70, resetsAt: null }]))).toBe(70);
     expect(headroomScore(null)).toBe(50);
+    // A window that reset since the reading counts as empty (2026-11-12: a just-reset account lost to fuller ones).
+    const reset = reading([{ id: "five_hour", label: "5h", usedPercent: 100, resetsAt: "2026-11-12T13:00:00Z" }, { id: "seven_day", label: "Week", usedPercent: 40, resetsAt: "2026-11-15T00:00:00Z" }]);
+    expect(headroomScore(reset, Date.parse("2026-11-12T13:01:00Z"))).toBe(40);
+    expect(headroomScore(reset, Date.parse("2026-11-12T12:59:00Z"))).toBe(100);
   });
 });
 
@@ -376,6 +381,16 @@ describe("the 5-hour gate (2026-11-12: a seat filled while work kept landing on 
     expect(mostAvailable(stateWith([main, seat]), "claude", under, NOW)?.id).toBe("claude-seat");
     const both = (id: string) => (id === "claude-seat" ? reading(85, 85) : reading(90, 88));
     expect(mostAvailable(stateWith([main, seat]), "claude", both, NOW)?.id).toBe("claude-seat");
+  });
+
+  it("moves work to the account that just reset, though its last reading showed it full", () => {
+    // 2026-11-12: every account out; the seat resets first. Session Guard holds the session until
+    // then and names the seat; ZeroSub's move must land there, not on a fuller account.
+    const third = account({ id: "claude-third" });
+    const after = Date.parse("2026-09-23T13:01:00Z");
+    const usageOf = (id: string) => (id === "claude-seat" ? reading(100, 30) : id === "claude-third" ? reading(70, 60) : reading(7, 88));
+    expect(mostAvailable(stateWith([seat, third]), "claude", usageOf, after)?.id).toBe("claude-seat");
+    expect(mostAvailable(stateWith([seat, third]), "claude", usageOf, Date.parse("2026-09-23T12:59:00Z"))?.id).toBe("claude-third");
   });
 
   it("counts a 5-hour window that already reset, or no reading, as open", async () => {

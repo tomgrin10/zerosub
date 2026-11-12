@@ -352,7 +352,15 @@ export class Service {
       const busy = now - (this.activeAt.get(account.id) ?? 0) < ACTIVE_WINDOW_MS;
       const isDefault = defaultAccount(state, account.family)?.id === account.id;
       const every = account.disabled ? USAGE_IDLE_MS : busy ? USAGE_BUSY_MS : isDefault ? USAGE_DEFAULT_MS : USAGE_IDLE_MS;
-      if (account.signedIn && now - attempted > every) {
+      // A limit or a window that lapsed since the last reading: read it now, so the account that
+      // just reset shows its room at once (and Session Guard's hold waiting for it ends then),
+      // rather than up to 20 minutes later.
+      const lapsed = (iso: string | null | undefined) => {
+        const at = iso ? Date.parse(iso) : NaN;
+        return Number.isFinite(at) && at <= now && at > attempted;
+      };
+      const justReset = lapsed(account.limitedUntil) || (this.usage.get(account.id)?.windows.some((window) => lapsed(window.resetsAt)) ?? false);
+      if (account.signedIn && (now - attempted > every || justReset)) {
         void this.refreshUsage(account.id).catch((error: unknown) => log(`usage refresh for ${account.label} failed`, error));
       }
       if (now - (this.identityCheckedAt.get(account.id) ?? 0) > IDENTITY_MS) {

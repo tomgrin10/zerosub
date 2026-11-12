@@ -41,7 +41,7 @@ Then open **Accounts (ZeroSub)** in the sidebar.
    - **Make default**: new agents, and agents that follow the default, use it. Open Claude agents switch right away, busy ones after their turn.
      - To leave open agents where they are, turn off **Move open agents when the default changes** (in Accounts, or **Settings → Plugins → zerosub → ZeroSub preferences**). Each open agent that follows the default then stays pinned to the account it's using, even after it reopens, unless that account is signed out, disabled or at its limit. New agents, and agents that aren't open at the time, use the new default.
      - A kept agent still switches when its account hits a limit. To move it to the new default, choose **Follow default** from its account button, or type `/account default`.
-   - **The account button in an agent's message box**: moves that one agent.
+   - **The account button in an agent's message box**: moves that one agent. A move reopens the agent's session, which would stop its background jobs (a `run_in_background` shell, say), so an agent with background jobs moves once they finish, and its timeline says so. The same goes for every move ZeroSub makes on its own.
    - **`/account work`** in the message box, or `/account default` to follow the default again.
    - **⌘K → "Make … the default"**.
    - **Disable for now** (the pause button on a card): the account stays signed in but ZeroSub stops using it. Its agents move to your other accounts right away (busy ones after their turn) and come back when you press **Enable**. ChatGPT conversations already on it stay, since they can't change accounts. You can't disable the last usable account of a provider.

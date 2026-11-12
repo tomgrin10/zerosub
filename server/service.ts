@@ -233,6 +233,8 @@ export class Service {
   private readonly moveOffs = new Map<string, Promise<void>>();
   /** When each out account's agents were last looked at for a move, epoch ms. */
   private readonly moveOffAt = new Map<string, number>();
+  private retrying = false;
+  private lastRetryAt = 0;
 
   constructor(
     private readonly adapters: Record<Family, FamilyAdapter>,
@@ -360,6 +362,10 @@ export class Service {
       // once they're between turns: their next turn would otherwise hit the limit, or with Extra
       // usage on, run on paid credits with no notice ZeroSub could switch on.
       if (isLimited(account, now) && now - (this.moveOffAt.get(account.id) ?? 0) >= MOVE_OFF_EVERY_MS) void this.moveOffOut(account.id);
+    }
+    if (this.deferred.size > 0 && now - this.lastRetryAt >= MOVE_OFF_EVERY_MS) {
+      this.lastRetryAt = now;
+      void this.retryDeferred().catch((error: unknown) => log("retrying waiting account moves failed", error));
     }
     for (const [id, login] of this.logins) {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
@@ -1214,6 +1220,33 @@ export class Service {
     return task;
   }
 
+  /**
+   * Moves that waited (a busy turn, background jobs, a held process) whose agent is now between
+   * turns: tried again, one at a time. `reopenAgent` defers again while the reason stands. Without
+   * this, an agent whose jobs finished with no turn ending after them never moved.
+   */
+  async retryDeferred(): Promise<void> {
+    const paseo = this.paseo;
+    if (!paseo || this.retrying) return;
+    this.retrying = true;
+    try {
+      const families = await this.families.resolve(paseo);
+      for (const agentId of [...this.deferred.keys()]) {
+        if (this.switching.has(agentId)) continue;
+        const info = await agentInfo(paseo, agentId);
+        const family = info ? families[info.provider] : undefined;
+        if (!info || info.archived || !family) {
+          this.deferred.delete(agentId);
+          continue;
+        }
+        if (!settled(info.status)) continue;
+        await this.finishDeferred(paseo, agentId, family);
+      }
+    } finally {
+      this.retrying = false;
+    }
+  }
+
   /** Idle agents still on an exhausted account would fail on their next turn; move them now. */
   private async moveIdleAgentsOff(
     paseo: PaseoApi,
@@ -1484,14 +1517,21 @@ export class Service {
     }
     // A reload closes the provider process, and its background jobs with it. Invariant: zerosub never
     // kills an agent's background work to move it; the move waits for a turn end with no jobs left.
+    // A move the user asked for waits too (2026-11-12: a hand move killed a running test suite), and
+    // says so in the agent's timeline; upkeep retries it once the jobs are done (`retryDeferred`).
     const jobs = Math.max(info.backgroundJobs, await this.countShells(agentId).catch(() => 0));
     if (jobs > 0) {
-      if (!explicit) {
-        console.log(`[ZeroSub] ${agentId} has ${jobs} background job(s); its account move waits until they're done`);
-        this.deferred.set(agentId, row);
-        return "deferred";
+      console.log(`[ZeroSub] ${agentId} has ${jobs} background job(s); its account move waits until they're done`);
+      const waiting = this.deferred.has(agentId);
+      this.deferred.set(agentId, row);
+      if (explicit && row && !waiting) {
+        await this.appendRow(paseo, agentId, {
+          ...row,
+          outcome: "pending",
+          detail: `It moves once its ${jobs === 1 ? "background job finishes" : `${jobs} background jobs finish`}, so ${jobs === 1 ? "it isn't" : "they aren't"} stopped.`,
+        });
       }
-      console.warn(`[ZeroSub] moving ${agentId} as asked: its ${jobs} background job(s) stop with its session`);
+      return "deferred";
     }
     const before = (await this.store.read()).sessions[agentId];
     const result = await this.reopener.reopen(agentId, paseo);

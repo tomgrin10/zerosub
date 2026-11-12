@@ -169,7 +169,7 @@ async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, p
     await next.refreshUsage(SEAT, true);
     return next;
   };
-  return { service, store, paseo: paseo as never, reopened, rows, reload };
+  return { service, store, paseo: paseo as never, reopened, rows, reload, agents };
 }
 
 /** Runs pace once a minute for `minutes` simulated minutes; returns when each reload happened. */
@@ -318,17 +318,19 @@ describe("background work (invariant: zerosub never kills an agent's background 
     expect(summary.deferred).toContain("render");
   });
 
-  it("a move the user asks for still happens, with a warning that the background jobs stop", async () => {
-    const { service, paseo, reopened } = await setUp([{ id: "render", backgroundJobs: 1 }]);
-    const warnings: string[] = [];
-    const warn = console.warn;
-    console.warn = (...args: unknown[]) => void warnings.push(args.join(" "));
-    try {
-      await service.setAgentAccount(paseo, "render", SEAT);
-    } finally {
-      console.warn = warn;
-    }
+  it("a move the user asks for waits for the background jobs too, says so, and happens once they're done", async () => {
+    // 2026-11-12: a hand move reopened an agent mid test suite and the suite died with its session.
+    const { service, paseo, reopened, rows, agents } = await setUp([{ id: "render", backgroundJobs: 1 }]);
+    const summary = await service.setAgentAccount(paseo, "render", SEAT);
+    expect(reopened).toEqual([]);
+    expect(summary.deferred).toEqual(["render"]);
+    expect(rows.map((entry) => [entry.agentId, entry.row.outcome])).toEqual([["render", "pending"]]);
+    expect(rows[0]!.row.detail).toMatch(/once its background job finishes/);
+    await service.retryDeferred();
+    expect(reopened).toEqual([]); // Still running a job.
+    (agents.find((agent) => agent.id === "render") as { backgroundWork?: { count: number } }).backgroundWork = { count: 0 };
+    await service.retryDeferred();
     expect(reopened).toEqual(["render"]);
-    expect(warnings.join("\n")).toMatch(/render.*1 background job.*stop/);
+    expect(rows.filter((entry) => entry.row.outcome === "pending")).toHaveLength(1);
   });
 });

@@ -87,7 +87,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
       }),
     },
   };
-  return { paseo, sent, notes, refetches };
+  return { paseo, sent, notes, refetches, agent };
 }
 
 interface SetUpOptions {
@@ -1313,5 +1313,87 @@ describe("the account button's reason row", () => {
     });
     expect((await route())?.accountId).toBe(MAIN);
     expect((await route())?.selectionReason).toBeUndefined();
+  });
+});
+
+describe("an account a usage reading finds full (2026-11-12: Extra usage on, so no turn ever reported the limit)", () => {
+  const fullFiveHours = (): UsageRead => ({
+    fetchedAt: new Date().toISOString(),
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: 100, resetsAt: inFuture() },
+      { id: "seven_day", label: "Weekly", usedPercent: 87, resetsAt: inFuture() },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+  });
+  const state = () => ({
+    accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+    defaults: { claude: MAIN, codex: null },
+  });
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+  const openOn = async (service: Service, paseo: unknown) =>
+    service.onSessionOpen({ agentId: AGENT, provider: "claude", reason: "resume", purpose: "interactive", env: {} } as never, { paseo } as never);
+
+  it("moves its idle agents to an account with room, as a turn's limit notice would", async () => {
+    const { service, store, reopened, paseo } = await setUp(state(), unused, { usage: fullFiveHours });
+    await openOn(service, paseo);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    await service.refreshUsage(MAIN, true);
+    // The reading itself starts the move: no turn, no upkeep pass.
+    await vi.waitFor(() => expect(reopened).toEqual([AGENT]));
+    const after = await store.read();
+    expect(after.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(after.bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "auto" });
+  });
+
+  it("moves a busy agent once its turn has ended, on a later pass", async () => {
+    const { service, store, reopened, paseo, agent } = await setUp(state(), unused, { usage: fullFiveHours });
+    await openOn(service, paseo);
+    agent.status = "running";
+    await service.refreshUsage(MAIN, true);
+    await service.moveOffOut(MAIN);
+    expect(reopened).toEqual([]);
+    agent.status = "idle";
+    await service.moveOffOut(MAIN);
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+  });
+
+  it("leaves everyone where they are with automatic switching off, or no account with room", async () => {
+    const off = await setUp(state(), unused, { usage: fullFiveHours });
+    off.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    await openOn(off.service, off.paseo);
+    await off.service.refreshUsage(MAIN, true);
+    await off.service.moveOffOut(MAIN);
+    expect(off.reopened).toEqual([]);
+
+    const nowhere = await setUp(
+      { ...state(), accounts: [account(MAIN, "marketing", "main"), { ...account(HELLO, "hello", "managed"), limitedUntil: inFuture() }] as never },
+      unused,
+      { usage: fullFiveHours },
+    );
+    await openOn(nowhere.service, nowhere.paseo);
+    await nowhere.service.refreshUsage(MAIN, true);
+    await nowhere.service.moveOffOut(MAIN);
+    expect(nowhere.reopened).toEqual([]);
+  });
+
+  it("leaves another plugin's one-shot helper on the account it was pinned to", async () => {
+    const { service, reopened, paseo, agent } = await setUp(state(), unused, { usage: fullFiveHours });
+    await openOn(service, paseo);
+    (agent as Record<string, unknown>).labels = { "smart-session.helper": "publish-as" };
+    await service.refreshUsage(MAIN, true);
+    await service.moveOffOut(MAIN);
+    expect(reopened).toEqual([]);
+  });
+
+  it("never wakes a closed agent to move it", async () => {
+    const { service, reopened, paseo, agent } = await setUp(state(), unused, { usage: fullFiveHours });
+    await openOn(service, paseo);
+    agent.status = "closed";
+    await service.refreshUsage(MAIN, true);
+    await service.moveOffOut(MAIN);
+    expect(reopened).toEqual([]);
   });
 });

@@ -42,7 +42,7 @@ import { canSignInWithBrowser } from "./machine";
 import { equivalentMode } from "./modes";
 import { homesDir } from "./paths";
 import { Reopener, hostReload } from "./reopen";
-import { backgroundShells, DuplicateWatch, type AgentContext, type DuplicateWatchOptions } from "./duplicates";
+import { backgroundShells, DuplicateWatch, providerStopped, type AgentContext, type DuplicateWatchOptions } from "./duplicates";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
 import { chooseAccount, isLimited, isUsable, mostAvailable } from "./routing";
@@ -79,6 +79,8 @@ const RENEW_LOGIN_MS = 30 * 60_000;
 /** An account counts as in use for this long after one of its agents starts or ends a turn. */
 const ACTIVE_WINDOW_MS = 15 * 60_000;
 const UPKEEP_MS = 30_000;
+/** How often agents left on an out account are looked at again for a move. */
+const MOVE_OFF_EVERY_MS = 60_000;
 const IDENTITY_MS = 30 * 60_000;
 const AVAILABILITY_MS = 10 * 60_000;
 /** Assumed length of a window limit whose reset time couldn't be read. */
@@ -225,6 +227,14 @@ export class Service {
   private readonly duplicateWatch: DuplicateWatch | null;
   /** Bash-tool shells under the agent's provider process (Linux); none under tests, which never read real processes. */
   private readonly countShells: (agentId: string) => Promise<number> = process.env.VITEST ? async () => 0 : (agentId) => backgroundShells(agentId);
+  /** Whether the agent's provider process is stopped (Smart Session's Session Guard holds it with SIGSTOP); never under tests. */
+  private readonly providerStopped: (agentId: string) => Promise<boolean> = process.env.VITEST ? async () => false : (agentId) => providerStopped(agentId);
+  /** Moves off an account that ran out, one pass at a time per account (see `moveOffOut`). */
+  private readonly moveOffs = new Map<string, Promise<void>>();
+  /** When each out account's agents were last looked at for a move, epoch ms. */
+  private readonly moveOffAt = new Map<string, number>();
+  private retrying = false;
+  private lastRetryAt = 0;
 
   constructor(
     private readonly adapters: Record<Family, FamilyAdapter>,
@@ -348,6 +358,14 @@ export class Service {
       if (now - (this.identityCheckedAt.get(account.id) ?? 0) > IDENTITY_MS) {
         void this.refreshIdentity(account.id).catch(() => undefined);
       }
+      // Agents still on an account that's out (busy then, or held, or with background jobs) move
+      // once they're between turns: their next turn would otherwise hit the limit, or with Extra
+      // usage on, run on paid credits with no notice ZeroSub could switch on.
+      if (isLimited(account, now) && now - (this.moveOffAt.get(account.id) ?? 0) >= MOVE_OFF_EVERY_MS) void this.moveOffOut(account.id);
+    }
+    if (this.deferred.size > 0 && now - this.lastRetryAt >= MOVE_OFF_EVERY_MS) {
+      this.lastRetryAt = now;
+      void this.retryDeferred().catch((error: unknown) => log("retrying waiting account moves failed", error));
     }
     for (const [id, login] of this.logins) {
       if (login.finishedAt && now - login.finishedAt > LOGIN_TTL_MS) this.logins.delete(id);
@@ -1177,12 +1195,64 @@ export class Service {
     }
   }
 
+  /**
+   * Moves the agents between turns off an account that's out, as a turn's limit notice would. A
+   * reading can find the account full before any turn reports it, and with Extra usage on the CLI
+   * never reports it at all: without this, nothing moved them and their next turns ran on paid
+   * credits (or Session Guard held them while another account had room, 2026-11-12). Busy agents
+   * move once their turn ends, on a later pass. One pass at a time per account; the promise is
+   * returned so tests can wait for it.
+   */
+  moveOffOut(accountId: string): Promise<void> {
+    const pending = this.moveOffs.get(accountId);
+    if (pending) return pending;
+    this.moveOffAt.set(accountId, Date.now());
+    const task = (async () => {
+      const paseo = this.paseo;
+      if (!paseo || !this.prefs.autoSwitch) return;
+      const account = findAccount(await this.store.read(), accountId);
+      if (!account || !isLimited(account, Date.now()) || !this.adapters[account.family].portable) return;
+      await this.moveIdleAgentsOff(paseo, accountId, account.family, null, "limit");
+    })()
+      .catch((error: unknown) => log("moving agents off a full account failed", error))
+      .finally(() => this.moveOffs.delete(accountId));
+    this.moveOffs.set(accountId, task);
+    return task;
+  }
+
+  /**
+   * Moves that waited (a busy turn, background jobs, a held process) whose agent is now between
+   * turns: tried again, one at a time. `reopenAgent` defers again while the reason stands. Without
+   * this, an agent whose jobs finished with no turn ending after them never moved.
+   */
+  async retryDeferred(): Promise<void> {
+    const paseo = this.paseo;
+    if (!paseo || this.retrying) return;
+    this.retrying = true;
+    try {
+      const families = await this.families.resolve(paseo);
+      for (const agentId of [...this.deferred.keys()]) {
+        if (this.switching.has(agentId)) continue;
+        const info = await agentInfo(paseo, agentId);
+        const family = info ? families[info.provider] : undefined;
+        if (!info || info.archived || !family) {
+          this.deferred.delete(agentId);
+          continue;
+        }
+        if (!settled(info.status)) continue;
+        await this.finishDeferred(paseo, agentId, family);
+      }
+    } finally {
+      this.retrying = false;
+    }
+  }
+
   /** Idle agents still on an exhausted account would fail on their next turn; move them now. */
   private async moveIdleAgentsOff(
     paseo: PaseoApi,
     accountId: string,
     family: Family,
-    except: string,
+    except: string | null,
     reason: "limit" | "signed_out",
   ): Promise<void> {
     const state = await this.store.read();
@@ -1193,6 +1263,10 @@ export class Service {
         (agent) =>
           agent.id !== except &&
           !agent.archived &&
+          // Closed (dormant) agents route themselves when they next open; never wake one.
+          isLive(agent.status) &&
+          // Another plugin's one-shot helper (Smart Session's publish-as) is pinned to its account on purpose and short-lived.
+          !agent.oneShotHelper &&
           families[agent.provider] === family &&
           this.runningOn(state, agent.id, family) === accountId,
       )
@@ -1434,16 +1508,30 @@ export class Service {
       }
       return "closed";
     }
+    // Session Guard holds an agent at a limit by stopping its provider process (SIGSTOP). Closing a
+    // stopped process hangs the reload; the move waits until the hold lets go and its turn ends.
+    if (!explicit && (await this.providerStopped(agentId).catch(() => false))) {
+      console.log(`[ZeroSub] ${agentId} is held (its provider process is stopped); its account move waits`);
+      this.deferred.set(agentId, row);
+      return "deferred";
+    }
     // A reload closes the provider process, and its background jobs with it. Invariant: zerosub never
     // kills an agent's background work to move it; the move waits for a turn end with no jobs left.
+    // A move the user asked for waits too (2026-11-12: a hand move killed a running test suite), and
+    // says so in the agent's timeline; upkeep retries it once the jobs are done (`retryDeferred`).
     const jobs = Math.max(info.backgroundJobs, await this.countShells(agentId).catch(() => 0));
     if (jobs > 0) {
-      if (!explicit) {
-        console.log(`[ZeroSub] ${agentId} has ${jobs} background job(s); its account move waits until they're done`);
-        this.deferred.set(agentId, row);
-        return "deferred";
+      console.log(`[ZeroSub] ${agentId} has ${jobs} background job(s); its account move waits until they're done`);
+      const waiting = this.deferred.has(agentId);
+      this.deferred.set(agentId, row);
+      if (explicit && row && !waiting) {
+        await this.appendRow(paseo, agentId, {
+          ...row,
+          outcome: "pending",
+          detail: `It moves once its ${jobs === 1 ? "background job finishes" : `${jobs} background jobs finish`}, so ${jobs === 1 ? "it isn't" : "they aren't"} stopped.`,
+        });
       }
-      console.warn(`[ZeroSub] moving ${agentId} as asked: its ${jobs} background job(s) stop with its session`);
+      return "deferred";
     }
     const before = (await this.store.read()).sessions[agentId];
     const result = await this.reopener.reopen(agentId, paseo);
@@ -1568,6 +1656,8 @@ export class Service {
       const cutOff = full && usage.windows.find((window) => window.usedPercent >= 100 && window.resetsAt && capsAccount(window));
       if (cutOff && !isLimited(account, now)) {
         await this.markLimited(accountId, cutOff.resetsAt ?? new Date(now + WINDOW_LIMIT_MS).toISOString(), "window", "reading");
+        console.log(`[ZeroSub] ${account.label} is out by its usage reading; moving its idle agents off it`);
+        void this.moveOffOut(accountId);
         return;
       }
       // A window limit clears once usage shows room again, or once credits cover it if a reading set

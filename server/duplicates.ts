@@ -416,3 +416,21 @@ export async function backgroundShells(agentId: string, procRoot = "/proc"): Pro
   }
   return shells;
 }
+
+/**
+ * Whether the agent's newest provider process is stopped (state T): Smart Session's Session Guard
+ * holds a session at a limit with SIGSTOP. A reload can't close a stopped process, so a move waits.
+ * Read-only; false off Linux or when nothing can be read.
+ */
+export async function providerStopped(agentId: string, procRoot = "/proc"): Promise<boolean> {
+  if (process.platform !== "linux" && procRoot === "/proc") return false;
+  const own = (await scanProviderProcesses(procRoot)).filter((entry) => entry.agentId === agentId);
+  const newest = own.sort((a, b) => a.startTicks - b.startTicks || a.pid - b.pid).at(-1);
+  if (!newest) return false;
+  try {
+    const stat = await readFile(join(procRoot, String(newest.pid), "stat"), "utf8");
+    return /^[Tt]$/.test(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0] ?? "");
+  } catch {
+    return false;
+  }
+}

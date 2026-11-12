@@ -1,7 +1,7 @@
 import { accountPeak } from "../shared/format";
 import type { Family, Usage } from "../shared/model";
 import { FIVE_HOUR_MINUTES, WEEK_MINUTES } from "./codex";
-import { pacePick } from "./pace";
+import { fiveHourWindow, PACE, pacePick, paceMayMove } from "./pace";
 import {
   accountsOf,
   defaultAccount,
@@ -38,7 +38,23 @@ export function headroomScore(usage: Usage | null | undefined): number {
   return peak ? peak.usedPercent : 50;
 }
 
-/** The usable account with the most room, preferring the default, then the CLI login, on ties. */
+/**
+ * Whether the account's 5-hour window is past pace's gate (`PACE.fiveHourMaxUsed`) and not reset yet.
+ * A gated account is about to run out: new work, and work that reopens, goes to an account under the
+ * gate first. Unknown counts as open, as it does for pace.
+ */
+export function fiveHourGated(usage: Usage | null | undefined, now: number): boolean {
+  const short = usage ? fiveHourWindow(usage) : undefined;
+  if (!short || !Number.isFinite(short.usedPercent)) return false;
+  if (short.resetsAt && Date.parse(short.resetsAt) <= now) return false;
+  return short.usedPercent >= PACE.fiveHourMaxUsed;
+}
+
+/**
+ * The usable account with the most room: one under the 5-hour gate before one past it (the peak
+ * alone let a seat at 81% of its 5 hours beat the CLI login at 88% of its week, and fill up minutes
+ * later), then the lowest peak, preferring the default, then the CLI login, on ties.
+ */
 export function mostAvailable(
   state: StoredState,
   family: Family,
@@ -51,6 +67,7 @@ export function mostAvailable(
     (account) => !exclude.has(account.id) && isUsable(account, now),
   );
   const rank = (account: StoredAccount) => [
+    fiveHourGated(usageOf(account.id), now) ? 1 : 0,
     headroomScore(usageOf(account.id)),
     account.id === preferred ? 0 : 1,
     account.kind === "main" ? 0 : 1,
@@ -145,6 +162,17 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
     const nearReset = input.family === "codex" ? soonestWeeklyReset(state, input.family, input.usageOf, input.now) : undefined;
     account = nearReset ?? mostAvailable(state, input.family, input.usageOf, input.now);
     if (account) bind = { accountId: account.id, source: "balance", at, selectionReason: nearReset ? "weekly_reset" : "headroom" };
+  }
+  if (account && !fresh && input.portable && input.autoSwitch && paceMayMove(binding) && accounts.length > 1 &&
+      isUsable(account, input.now) && fiveHourGated(input.usageOf(account.id), input.now)) {
+    // A reopening agent that ZeroSub placed (spread at creation, or paced) on an account about to run
+    // out of its 5 hours goes to one under the gate instead, if there is one. The user's own choice,
+    // a limit's re-pin and a thread stay put.
+    const open = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
+    if (open && !fiveHourGated(input.usageOf(open.id), input.now)) {
+      account = open;
+      bind = { accountId: open.id, source: "balance", at, selectionReason: "headroom" };
+    }
   }
   if (!account) {
     // An existing Codex thread ZeroSub never routed (imported from the user's own CLI, or started

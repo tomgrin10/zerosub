@@ -348,3 +348,68 @@ describe("headroom", () => {
     expect(headroomScore(null)).toBe(50);
   });
 });
+
+describe("the 5-hour gate (2026-11-12: a seat filled while work kept landing on it)", () => {
+  const main = account({ id: "claude-main", kind: "main", home: null });
+  const seat = account({ id: "claude-seat" });
+  const reading = (fiveHour: number, weekly: number): Usage => ({
+    fetchedAt: "2026-09-23T11:59:00Z",
+    windows: [
+      { id: "five_hour", label: "5-hour", usedPercent: fiveHour, resetsAt: "2026-09-23T13:00:00Z" },
+      { id: "seven_day", label: "Weekly", usedPercent: weekly, resetsAt: "2026-09-25T00:00:00Z" },
+    ],
+    error: null,
+    cached: false,
+    resets: null,
+    credits: null,
+  });
+  // 11:14Z: the seat at 81% of its 5 hours (85% weekly) against the CLI login at 7% (88% weekly).
+  const at1114 = (id: string) => (id === "claude-seat" ? reading(81, 85) : reading(7, 88));
+
+  it("starts a new agent under the gate, though the gated seat has the lower peak", () => {
+    const decision = chooseAccount(stateWith([main, seat]), { ...base, balanceNewAgents: true, reason: "create", usageOf: at1114 });
+    expect(decision?.account.id).toBe("claude-main");
+  });
+
+  it("still ranks by peak while both are under the gate, or both past it", () => {
+    const under = (id: string) => (id === "claude-seat" ? reading(50, 85) : reading(7, 88));
+    expect(mostAvailable(stateWith([main, seat]), "claude", under, NOW)?.id).toBe("claude-seat");
+    const both = (id: string) => (id === "claude-seat" ? reading(85, 85) : reading(90, 88));
+    expect(mostAvailable(stateWith([main, seat]), "claude", both, NOW)?.id).toBe("claude-seat");
+  });
+
+  it("counts a 5-hour window that already reset, or no reading, as open", async () => {
+    const { fiveHourGated } = await import("./routing");
+    const past = { ...reading(95, 85), windows: [{ id: "five_hour", label: "5-hour", usedPercent: 95, resetsAt: "2026-09-23T11:00:00Z" }] };
+    expect(fiveHourGated(past, NOW)).toBe(false);
+    expect(fiveHourGated(null, NOW)).toBe(false);
+    expect(fiveHourGated(reading(80, 0), NOW)).toBe(true);
+    expect(fiveHourGated(reading(79, 0), NOW)).toBe(false);
+  });
+
+  for (const source of ["pace", "balance"] as const) {
+    it(`reopens a ${source}-placed agent on an account under the gate`, () => {
+      const state = stateWith([main, seat], { bindings: { "agent-1": { accountId: "claude-seat", source, at: "2026-09-23T00:00:00Z" } } });
+      const gated = (id: string) => (id === "claude-seat" ? reading(92, 86) : reading(7, 88));
+      const decision = chooseAccount(state, { ...base, reason: "resume", usageOf: gated });
+      expect(decision?.account.id).toBe("claude-main");
+      expect(decision?.bind).toMatchObject({ accountId: "claude-main", source: "balance" });
+    });
+  }
+
+  it("leaves the user's choice, a limit's re-pin and a thread on the gated account", () => {
+    const gated = (id: string) => (id === "claude-seat" ? reading(92, 86) : reading(7, 88));
+    for (const source of ["user", "auto"] as const) {
+      const state = stateWith([main, seat], { bindings: { "agent-1": { accountId: "claude-seat", source, at: "2026-09-23T00:00:00Z" } } });
+      expect(chooseAccount(state, { ...base, reason: "resume", usageOf: gated })?.account.id).toBe("claude-seat");
+    }
+  });
+
+  it("stays put when every other account is past the gate too, or switching is off", () => {
+    const state = stateWith([main, seat], { bindings: { "agent-1": { accountId: "claude-seat", source: "pace", at: "2026-09-23T00:00:00Z" } } });
+    const bothGated = (id: string) => (id === "claude-seat" ? reading(92, 86) : reading(85, 88));
+    expect(chooseAccount(state, { ...base, reason: "resume", usageOf: bothGated })?.account.id).toBe("claude-seat");
+    const gated = (id: string) => (id === "claude-seat" ? reading(92, 86) : reading(7, 88));
+    expect(chooseAccount(state, { ...base, autoSwitch: false, reason: "resume", usageOf: gated })?.account.id).toBe("claude-seat");
+  });
+});

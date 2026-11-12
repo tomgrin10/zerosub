@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { backgroundShells, captureDaemonLogs, DuplicateWatch, findDuplicates, REAP, scanProviderProcesses, type AgentContext, type Duplicate } from "./duplicates";
+import { backgroundShells, captureDaemonLogs, providerStopped, DuplicateWatch, findDuplicates, REAP, scanProviderProcesses, type AgentContext, type Duplicate } from "./duplicates";
 
 // A synthetic /proc and daemon home; nothing real is scanned, signalled or copied.
 let root: string;
@@ -12,7 +12,7 @@ const SECRET = "sk-should-never-leave";
 
 const CLAUDE = ["/home/u/.local/bin/claude", "--output-format", "stream-json", "--input-format", "stream-json", "--verbose"];
 
-async function fakeProcess(pid: number, options: { ppid?: number; argv: string[]; env: Record<string, string>; startSec?: number; cpu?: number }) {
+async function fakeProcess(pid: number, options: { ppid?: number; argv: string[]; env: Record<string, string>; startSec?: number; cpu?: number; state?: string }) {
   const dir = join(proc, String(pid));
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, "cmdline"), options.argv.join("\0") + "\0");
@@ -20,7 +20,7 @@ async function fakeProcess(pid: number, options: { ppid?: number; argv: string[]
   // pid (comm) state ppid ... field 22 = starttime in clock ticks; the name holds a space and parens.
   // utime/stime are fields 14/15 (index 11/12 here).
   const cpu = options.cpu ?? 0;
-  const fields = ["S", String(options.ppid ?? 1), ...Array(9).fill("0"), String(cpu), "0", ...Array(6).fill("0"), String((options.startSec ?? 0) * 100), "0"];
+  const fields = [options.state ?? "S", String(options.ppid ?? 1), ...Array(9).fill("0"), String(cpu), "0", ...Array(6).fill("0"), String((options.startSec ?? 0) * 100), "0"];
   await writeFile(join(dir, "stat"), `${pid} (claude (x) y) ${fields.join(" ")}\n`);
 }
 
@@ -305,5 +305,18 @@ describe("background shells", () => {
     expect(await backgroundShells("agent-e", proc)).toBe(2);
     expect(await backgroundShells("agent-f", proc)).toBe(1);
     expect(await backgroundShells("agent-none", proc)).toBe(0);
+  });
+});
+
+describe("a provider process held by Session Guard", () => {
+  it("reads the newest provider process's stopped state, and nothing else's", async () => {
+    await fakeProcess(950, { ppid: 2639, argv: CLAUDE, env: { PASEO_AGENT_ID: "agent-h" }, startSec: 10, state: "T" });
+    await fakeProcess(951, { ppid: 2639, argv: CLAUDE, env: { PASEO_AGENT_ID: "agent-i" }, startSec: 10, state: "T" });
+    await fakeProcess(952, { ppid: 2639, argv: CLAUDE, env: { PASEO_AGENT_ID: "agent-i" }, startSec: 20, state: "S" });
+    await fakeProcess(953, { ppid: 950, argv: ["/bin/bash", "-c", "sleep 9"], env: { PASEO_AGENT_ID: "agent-j" }, state: "T" });
+    expect(await providerStopped("agent-h", proc)).toBe(true);
+    expect(await providerStopped("agent-i", proc)).toBe(false);
+    expect(await providerStopped("agent-j", proc)).toBe(false);
+    expect(await providerStopped("agent-none", proc)).toBe(false);
   });
 });

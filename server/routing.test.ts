@@ -90,6 +90,22 @@ describe("chooseAccount", () => {
     expect(chooseAccount(state, { ...base, reason: "resume", usageOf: () => null })?.account.id).toBe("claude-main");
   });
 
+  it("keeps a binding that allows a limited account on it (a one-shot helper on Extra usage)", () => {
+    const limited = account({ id: "claude-main", kind: "main", home: null, limitedUntil: "2026-09-23T14:00:00Z" });
+    const state = stateWith([limited, work], {
+      bindings: { "agent-1": { accountId: "claude-main", source: "user", at: "x", allowLimited: true } },
+    });
+    for (const reason of ["create", "refresh", "resume"] as const) {
+      const decision = chooseAccount(state, { ...base, reason, usageOf: () => usage(10) });
+      expect(decision?.account.id, reason).toBe("claude-main");
+      expect(decision?.skipped, reason).toBeNull();
+      expect(decision?.bind, reason).toBeNull();
+    }
+    // Signed out or disabled still can't take it.
+    const out = stateWith([{ ...limited, signedIn: false }, work], { bindings: state.bindings });
+    expect(chooseAccount(out, { ...base, reason: "refresh", usageOf: () => usage(10) })?.account.id).toBe("claude-work");
+  });
+
   it("skips an exhausted account for the roomiest usable one", () => {
     const limited = account({ id: "claude-work", limitedUntil: "2026-09-23T14:00:00Z" });
     const state = stateWith([main, limited, personal], { defaults: { claude: "claude-work", codex: null } });

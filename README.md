@@ -119,6 +119,8 @@ Each added account gets its own credential home under `$PASEO_HOME/zerosub/homes
 
 A `before("agent.session_open")` hook sets those variables for every session Paseo opens: create, resume, refresh and import. To move a live agent, ZeroSub reopens its session with `paseo agent reload`. It never interrupts a running turn; a busy agent moves when its turn ends.
 
+Another plugin's one-shot helper (Smart Session's publish-as helper) can be pinned to a limited account with `zerosub.agents.account` and `allowLimited: true`. It then stays there and runs on that account's paid usage: routing doesn't swap it, and a limit mid-turn doesn't move or continue it. Any other agent asking for this is refused.
+
 Sign-in runs the official CLIs:
 
 - Claude: `claude auth login`.

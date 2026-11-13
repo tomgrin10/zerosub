@@ -46,6 +46,12 @@ export const BindingSchema = z.object({
   source: z.enum(["user", "auto", "balance", "thread", "pace"]),
   at: z.string(),
   selectionReason: z.enum(["weekly_reset", "headroom"]).optional(),
+  /**
+   * Keep the agent on this account even while it is limited: no routing swap, no failover move or
+   * continue. Only a one-shot helper can be pinned this way (Smart Session's publish-as helper on
+   * the main account's Extra usage); see `Service.setAgentAccount`.
+   */
+  allowLimited: z.literal(true).optional(),
 });
 export type Binding = z.infer<typeof BindingSchema>;
 

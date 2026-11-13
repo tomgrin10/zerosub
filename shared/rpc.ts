@@ -125,6 +125,11 @@ export const setAgentAccount = defineRpc({
     agentId: z.string(),
     /** `null` makes the agent follow the default account again. */
     accountId: z.string().nullable(),
+    /**
+     * Keep the agent on `accountId` even while that account is limited (it runs on paid usage
+     * there). Only for a one-shot helper another plugin made; anything else is refused.
+     */
+    allowLimited: z.boolean().optional(),
   }),
   output: ReopenSummarySchema,
 });

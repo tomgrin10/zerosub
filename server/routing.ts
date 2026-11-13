@@ -192,7 +192,9 @@ export function chooseAccount(state: StoredState, input: RouteInput): RouteDecis
   let skipped: RouteDecision["skipped"] = null;
   const why = !account.signedIn ? "signed_out" : account.disabled ? "disabled" : isLimited(account, input.now) ? "limited" : null;
   const mayMove = fresh || input.portable;
-  if (why && mayMove && (input.autoSwitch || why !== "limited")) {
+  // A one-shot helper pinned with `allowLimited` runs on its account's paid usage on purpose.
+  const keepLimited = why === "limited" && binding?.allowLimited === true && account === bound;
+  if (why && mayMove && !keepLimited && (input.autoSwitch || why !== "limited")) {
     const alternative = mostAvailable(state, input.family, input.usageOf, input.now, new Set([account.id]));
     if (alternative) {
       skipped = { account, why };

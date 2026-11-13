@@ -201,6 +201,27 @@ describe("failover", () => {
     expect(notes.at(-1)?.detail).toMatch(/stopped switching it for now/);
   });
 
+  it("never moves or continues a one-shot helper pinned to a limited account", async () => {
+    // Smart Session's publish-as helper on the main account's Extra usage: when that runs out mid-turn,
+    // carrying the publish on elsewhere would make the page on an account the person can't open.
+    const { store, reopened, sent, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null },
+        bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true } },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      () => ({ kind: "budget", resetsAt: null, message: "You're out of extra usage" }),
+    );
+    await limitTurn();
+    const state = await store.read();
+    expect(state.accounts.find((a) => a.id === MAIN)?.limitKind).toBe("budget");
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: MAIN, allowLimited: true });
+    expect(reopened).toEqual([]);
+    expect(sent).toEqual([]);
+  });
+
   it("doesn't blame the new account for the old one's limit when a message fails before its turn starts", async () => {
     // A real incident: marketing's weekly limit moved the agent to hello, then a message hit a closed
     // session. Paseo never started that turn, so the timeline still ended with marketing's notice.

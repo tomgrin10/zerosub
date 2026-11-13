@@ -869,6 +869,11 @@ export class Service {
     }
 
     if (!this.prefs.autoSwitch) return;
+    if ((await this.store.read()).bindings[agentId]?.allowLimited) {
+      // A one-shot helper kept on this account on purpose: its work belongs there, so it stops.
+      console.log(`[ZeroSub] ${agentId} is kept on ${account.label}; not moving it`);
+      return;
+    }
     if (elsewhere) {
       await this.noteElsewhere(paseo, agentId, account, problem.kind, resetsAt, elsewhere, "switch");
       return;
@@ -1973,10 +1978,18 @@ export class Service {
     void this.refreshUsage(accountId, true).catch(() => undefined);
   }
 
-  async setAgentAccount(paseo: PaseoApi, agentId: string, accountId: string | null): Promise<ReopenSummary> {
+  async setAgentAccount(
+    paseo: PaseoApi,
+    agentId: string,
+    accountId: string | null,
+    options: { allowLimited?: boolean } = {},
+  ): Promise<ReopenSummary> {
     this.attach(paseo);
     const info = await agentInfo(paseo, agentId);
     if (!info) throw new Error("That agent is no longer available.");
+    const allowLimited = options.allowLimited === true;
+    if (allowLimited && !accountId) throw new Error("Name the account to keep the agent on.");
+    if (allowLimited && !info.oneShotHelper) throw new Error("Only a one-shot helper can be kept on a limited account.");
     const family = (await this.families.resolve(paseo))[info.provider];
     if (!family) throw new Error(`${info.provider} agents don't use Claude or ChatGPT subscription accounts.`);
     const adapter = this.adapters[family];
@@ -2021,7 +2034,14 @@ export class Service {
 
     await this.store.update((draft) => {
       const now = Date.now();
-      if (accountId) draft.bindings[agentId] = { accountId, source: adapter.portable ? "user" : "thread", at: new Date(now).toISOString() };
+      if (accountId) {
+        draft.bindings[agentId] = {
+          accountId,
+          source: adapter.portable ? "user" : "thread",
+          at: new Date(now).toISOString(),
+          ...(allowLimited ? { allowLimited: true as const } : {}),
+        };
+      }
       else delete draft.bindings[agentId];
       // Pace leaves a hand re-route alone for a while, across plugin reloads too.
       for (const [id, at] of Object.entries(draft.pace.routedByHand)) {

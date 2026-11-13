@@ -16,14 +16,14 @@ import { emptyState, type Binding, type StoredAccount, type StoredState } from "
 
 const NOW = Date.parse("2026-11-10T12:00:00Z");
 const HOUR = 3_600_000;
-const MAIN = "claude-main"; // tom.gringauz: the CLI login and the default
-const SEAT = "claude-seat-1";
+const MAIN = "claude-main"; // alice@example.com: the CLI login and the default
+const SEAT = "seat-a";
 
 function account(id: string, partial: Partial<StoredAccount> = {}): StoredAccount {
   return {
     id,
     family: "claude",
-    label: id === MAIN ? "tom.gringauz" : id,
+    label: id === MAIN ? "alice@example.com" : id,
     autoLabel: false,
     kind: id === MAIN ? "main" : "managed",
     home: id === MAIN ? null : `/homes/${id}`,
@@ -59,7 +59,7 @@ function reading(weekly: [number, number] | null, fiveHour = 20, patch: Partial<
   };
 }
 
-/** Yesterday: tom.gringauz 64% used, resets in 4d9h; claude-seat-1 37% used, resets in 2d7h. */
+/** Yesterday: alice@example.com 64% used, resets in 4d9h; seat-a 37% used, resets in 2d7h. */
 const YESTERDAY: Record<string, Usage> = {
   [MAIN]: reading([64, 4 * 24 + 9]),
   [SEAT]: reading([37, 2 * 24 + 7]),
@@ -110,7 +110,7 @@ describe("pace score", () => {
   it("scores yesterday's accounts by remaining weekly % per hour to the reset", () => {
     expect(paceScore(YESTERDAY[MAIN], NOW)).toBeCloseTo(36 / 105, 5);
     expect(paceScore(YESTERDAY[SEAT], NOW)).toBeCloseTo(63 / 55, 5);
-    // tom.gringauz is over pace, claude-seat-1 well under it.
+    // alice@example.com is over pace, seat-a well under it.
     expect(paceScore(YESTERDAY[MAIN], NOW)!).toBeLessThan(ON_PACE_SCORE);
     expect(paceScore(YESTERDAY[SEAT], NOW)!).toBeGreaterThan(ON_PACE_SCORE * PACE.ratio);
   });
@@ -129,7 +129,7 @@ describe("pace score", () => {
 });
 
 describe("placing new agents", () => {
-  it("puts yesterday's new agents on claude-seat-1, bound by pace, not by the user", () => {
+  it("puts yesterday's new agents on seat-a, bound by pace, not by the user", () => {
     expect(pacePick(stateWith(), "claude", (id) => YESTERDAY[id], NOW)?.id).toBe(SEAT);
     const decision = chooseAccount(stateWith(), {
       agentId: "new",
@@ -222,7 +222,7 @@ describe("placing new agents", () => {
 });
 
 describe("moving idle agents", () => {
-  it("moves one of yesterday's idle tom.gringauz agents to claude-seat-1", () => {
+  it("moves one of yesterday's idle alice@example.com agents to seat-a", () => {
     expect(plan()).toEqual({ agentId: "a", family: "claude", from: MAIN, to: SEAT, reason: "pace" });
   });
 

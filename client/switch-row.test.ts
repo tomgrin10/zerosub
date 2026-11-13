@@ -9,8 +9,8 @@ const { describeRow } = await import("./switch-row");
 function row(partial: Partial<SwitchRow>): SwitchRow {
   return {
     family: "claude",
-    from: "tom.gringauz",
-    to: "claude-seat-1",
+    from: "alice@example.com",
+    to: "seat-a",
     reason: "pace",
     resetsAt: null,
     continued: false,
@@ -25,12 +25,12 @@ function row(partial: Partial<SwitchRow>): SwitchRow {
 
 describe("the switch note", () => {
   it("says a pace move was to pace weekly usage", () => {
-    expect(describeRow(row({}))).toBe("Moved from tom.gringauz to claude-seat-1 to pace weekly usage.");
+    expect(describeRow(row({}))).toBe("Moved from alice@example.com to seat-a to pace weekly usage.");
   });
 
   it("says why an agent is back on the default once pacing is off", () => {
-    expect(describeRow(row({ reason: "pace_off", from: "claude-seat-1", to: "tom.gringauz" }))).toBe(
-      "Back on tom.gringauz, the default, now that weekly pacing is off.",
+    expect(describeRow(row({ reason: "pace_off", from: "seat-a", to: "alice@example.com" }))).toBe(
+      "Back on alice@example.com, the default, now that weekly pacing is off.",
     );
   });
 });

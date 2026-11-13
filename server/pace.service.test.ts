@@ -12,7 +12,7 @@ import { Service } from "./service";
 import { MAIN_ACCOUNT_ID, StateStore, type Binding, type StoredState } from "./state";
 
 const MAIN = MAIN_ACCOUNT_ID.claude;
-const SEAT = "claude-seat-1";
+const SEAT = "seat-a";
 const HOUR = 3_600_000;
 const MINUTE = 60_000;
 
@@ -31,7 +31,7 @@ afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
 
-/** Yesterday's readings, relative to the real clock: tom.gringauz 64% (resets in 4d9h), claude-seat-1 37% (2d7h). */
+/** Yesterday's readings, relative to the real clock: alice@example.com 64% (resets in 4d9h), seat-a 37% (2d7h). */
 function yesterday(home: string | null): UsageRead {
   const now = Date.now();
   const [used, hours] = home === null ? [64, 105] : [37, 55];
@@ -82,8 +82,8 @@ async function setUp(listed: Listed[], bindings: Record<string, Binding> = {}, p
   await store.update((draft) =>
     Object.assign(draft, {
       accounts: [
-        { id: MAIN, family: "claude", label: "tom.gringauz", kind: "main", home: null, createdAt: openedAt },
-        { id: SEAT, family: "claude", label: "claude-seat-1", kind: "managed", home: join(tmpdir(), SEAT), createdAt: openedAt },
+        { id: MAIN, family: "claude", label: "alice@example.com", kind: "main", home: null, createdAt: openedAt },
+        { id: SEAT, family: "claude", label: "seat-a", kind: "managed", home: join(tmpdir(), SEAT), createdAt: openedAt },
       ],
       defaults: { claude: MAIN, codex: null },
       bindings,
@@ -220,7 +220,7 @@ describe("pacing weekly usage", () => {
     const state = await store.read();
     expect(state.bindings["idle-0"]).toMatchObject({ accountId: SEAT, source: "pace" });
     expect(state.sessions["idle-0"]?.accountId).toBe(SEAT);
-    expect(rows[0]).toMatchObject({ agentId: "idle-0", row: { reason: "pace", from: "tom.gringauz", to: "claude-seat-1" } });
+    expect(rows[0]).toMatchObject({ agentId: "idle-0", row: { reason: "pace", from: "alice@example.com", to: "seat-a" } });
   });
 
   it("never places or moves a background agent", async () => {
@@ -286,7 +286,7 @@ describe("pacing weekly usage", () => {
     expect(state.bindings.closed).toBeUndefined();
     expect(state.bindings.gone).toBeUndefined();
     expect(reopened).toHaveLength(1);
-    expect(rows[0]?.row).toMatchObject({ reason: "pace_off", to: "tom.gringauz" });
+    expect(rows[0]?.row).toMatchObject({ reason: "pace_off", to: "alice@example.com" });
     await run(service, paseo, reopened, PACE.moveEveryMs / MINUTE);
     expect(reopened).toHaveLength(1);
     await service.pace(paseo, Date.now() + PACE.moveEveryMs);

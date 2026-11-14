@@ -199,6 +199,10 @@ export class Service {
   /** One failover at a time per exhausted account. */
   private readonly failoverLocks = new Map<string, Mutex>();
   private readonly switchGuard = new SwitchGuard();
+  /** Upkeep finishes a lost move at most once per agent in 10 minutes (`moveDrifted`). */
+  private readonly driftGuard = new SwitchGuard(1, 10 * 60_000);
+  private driftPass: Promise<void> | null = null;
+  private lastDriftAt = 0;
   /** When ZeroSub last told an agent's timeline why it didn't switch, by agent and notice, so it says so once. */
   private readonly guardNoticeAt = new Map<string, number>();
   /** When each account's agents last started or ended a turn, to read busy accounts often. */
@@ -370,6 +374,10 @@ export class Service {
       // once they're between turns: their next turn would otherwise hit the limit, or with Extra
       // usage on, run on paid credits with no notice ZeroSub could switch on.
       if (isLimited(account, now) && now - (this.moveOffAt.get(account.id) ?? 0) >= MOVE_OFF_EVERY_MS) void this.moveOffOut(account.id);
+    }
+    if (now - this.lastDriftAt >= MOVE_OFF_EVERY_MS) {
+      this.lastDriftAt = now;
+      void this.moveDrifted();
     }
     if (this.deferred.size > 0 && now - this.lastRetryAt >= MOVE_OFF_EVERY_MS) {
       this.lastRetryAt = now;
@@ -1258,6 +1266,73 @@ export class Service {
     } finally {
       this.retrying = false;
     }
+  }
+
+  /**
+   * Finishes moves that were lost. A move that waits for a turn, background jobs or a held process
+   * is kept in memory (`deferred`), and a plugin reload drops it: the agent then stayed on the old
+   * account while its binding named another (2026-11-12, for a day). So upkeep reads it from the
+   * saved state instead: a live agent whose session runs on another account than its own binding,
+   * where routing would put it now, moves once it's between turns.
+   *
+   * Invariant: the saved binding, not memory, decides where a live portable agent belongs, and a
+   * move toward it is never lost. The guards stay: never a closed (dormant) agent, never one with
+   * background jobs or a held process (`reopenAgent` waits), never a one-shot helper, never a
+   * Codex thread, at most one such move per agent in 10 minutes, and a limited, signed-out or
+   * disabled bound account is left to the limit paths. The promise is returned for tests.
+   */
+  moveDrifted(): Promise<void> {
+    if (this.driftPass) return this.driftPass;
+    const task = (async () => {
+      const paseo = this.paseo;
+      if (!paseo) return;
+      const families = await this.families.resolve(paseo);
+      const state = await this.store.read();
+      const now = Date.now();
+      for (const agent of await this.cachedAgents(paseo)) {
+        const family = families[agent.provider];
+        if (!family || !this.adapters[family].portable) continue;
+        if (agent.archived || !isLive(agent.status) || agent.oneShotHelper) continue;
+        const bound = state.bindings[agent.id]?.accountId;
+        const running = state.sessions[agent.id]?.accountId;
+        if (!bound || !running || bound === running || this.targetFor(state, agent.id, family) !== bound) continue;
+        if (this.switching.has(agent.id) || !this.driftGuard.allows(agent.id, now) || !this.switchGuard.allows(agent.id, now)) continue;
+        const info = await agentInfo(paseo, agent.id);
+        if (!info || info.archived || !settled(info.status)) continue;
+        this.switching.add(agent.id);
+        try {
+          const row: SwitchRow = {
+            family,
+            from: findAccount(state, running)?.label ?? null,
+            to: findAccount(state, bound)?.label ?? bound,
+            reason: "manual",
+            resetsAt: null,
+            continued: false,
+            continuedIn: null,
+            toFamily: null,
+            outcome: "switched",
+            detail: null,
+            at: new Date(now).toISOString(),
+          };
+          const outcome = await this.reopenAgent(paseo, agent.id, row);
+          if (outcome === "deferred") continue; // Jobs or a hold: a later pass tries again.
+          this.driftGuard.note(agent.id, now);
+          this.switchGuard.note(agent.id, now);
+          if (outcome === "reopened") {
+            console.log(`[ZeroSub] ${agent.id} ran on another account than its binding; moved it`);
+            await this.appendRow(paseo, agent.id, await this.landed(row, agent.id));
+          }
+        } finally {
+          this.switching.delete(agent.id);
+        }
+      }
+    })()
+      .catch((error: unknown) => log("finishing lost account moves failed", error))
+      .finally(() => {
+        this.driftPass = null;
+      });
+    this.driftPass = task;
+    return task;
   }
 
   /** Idle agents still on an exhausted account would fail on their next turn; move them now. */

@@ -11,6 +11,7 @@ import {
   removeAccount,
   renameAccount,
   setAgentAccount,
+  moveBeforeLimit,
   setDefaultAccount,
   setAccountEnabled,
   forkAgent,
@@ -85,6 +86,7 @@ export default function contribute(server: PluginServerContext) {
   server.handle(setAgentAccount, ({ agentId, accountId, allowLimited }, { paseo }) =>
     service.setAgentAccount(paseo, agentId, accountId, { allowLimited: allowLimited === true }),
   );
+  server.handle(moveBeforeLimit, ({ agentId, accountId }, { paseo }) => service.moveBeforeLimit(paseo, agentId, accountId));
   server.handle(forkAgent, ({ agentId }, { paseo }) => service.forkAgent(paseo, agentId));
   server.handle(setAccountEnabled, ({ accountId, enabled }, { paseo }) => service.setAccountEnabled(paseo, accountId, enabled));
 

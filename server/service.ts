@@ -2127,6 +2127,59 @@ export class Service {
     return this.reconcile(paseo, "manual", [agentId]);
   }
 
+  /**
+   * Moves one agent, between turns, to `accountId` before its own account is out (see the RPC).
+   * Invariant: Session Guard never holds a session at its threshold while ZeroSub could move it to
+   * an account with room; this is how it asks. The guards are ZeroSub's own: automatic switching on,
+   * a usable target of the agent's provider, a portable live agent that isn't a one-shot helper, the
+   * bounce guard, and `reopenAgent`, which never wakes a closed agent and waits for a running turn,
+   * background jobs or a stopped process. The binding is ZeroSub's (`auto`), as after a limit.
+   */
+  async moveBeforeLimit(paseo: PaseoApi, agentId: string, accountId: string): Promise<{ outcome: "moved" | "waiting" | "already" | "refused"; detail: string | null }> {
+    this.attach(paseo);
+    const refused = (detail: string) => ({ outcome: "refused" as const, detail });
+    if (!this.prefs.autoSwitch) return refused("Automatic switching is off.");
+    const info = await agentInfo(paseo, agentId);
+    if (!info || info.archived || info.status === "closed") return refused("The agent isn't open.");
+    if (info.oneShotHelper) return refused("A one-shot helper stays where it was pinned.");
+    const family = (await this.families.resolve(paseo))[info.provider];
+    if (!family || !this.adapters[family].portable) return refused("This agent's conversation can't change accounts.");
+    const state = await this.store.read();
+    const target = findAccount(state, accountId);
+    const now = Date.now();
+    if (!target || target.family !== family || !isUsable(target, now)) return refused("That account can't take it now.");
+    const current = this.runningOn(state, agentId, family);
+    if (current === target.id) return { outcome: "already", detail: null };
+    if (this.switching.has(agentId) || !this.switchGuard.allows(agentId, now)) return refused("It changed accounts too often just now.");
+    this.switching.add(agentId);
+    try {
+      await this.store.update((draft) => {
+        draft.bindings[agentId] = { accountId: target.id, source: "auto", at: new Date(now).toISOString() };
+      });
+      this.switchGuard.note(agentId, now);
+      const row: SwitchRow = {
+        family,
+        from: findAccount(state, current)?.label ?? null,
+        to: target.label,
+        reason: "near_limit",
+        resetsAt: null,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        outcome: "switched",
+        detail: null,
+        at: new Date(now).toISOString(),
+      };
+      const outcome = await this.reopenAgent(paseo, agentId, row);
+      if (outcome === "deferred") return { outcome: "waiting", detail: "It moves once its turn and background jobs end." };
+      if (outcome !== "reopened") return refused("It couldn't be reopened on that account.");
+      await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+      return { outcome: "moved", detail: null };
+    } finally {
+      this.switching.delete(agentId);
+    }
+  }
+
   async rename(accountId: string, label: string): Promise<void> {
     const state = await this.store.update((draft) => {
       const account = findAccount(draft, accountId);

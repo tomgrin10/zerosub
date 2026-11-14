@@ -40,6 +40,12 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
   never one with background jobs or a stopped process, never a one-shot helper or a Codex thread, at most one such
   move per agent in 10 minutes; a limited, signed-out or disabled bound account is left to the limit paths.
   Tests: "a waiting move survives a plugin reload" in `server/failover.test.ts`.
+- **Session Guard never holds a session at its threshold while ZeroSub could move it.** The guard pauses at its own
+  threshold (below 100%), where ZeroSub doesn't see a limit yet, so it asks: `zerosub.agents.move_before_limit` moves
+  that one agent, between turns, to the account the guard names (binding `auto`, timeline reason `near_limit`).
+  ZeroSub's guards apply: automatic switching on, a usable target, a portable open agent that isn't a one-shot
+  helper, the bounce guard, and `reopenAgent` (never wakes a closed agent; waits for a turn, background jobs or a
+  stopped process, and answers `waiting`). Tests: "a move Session Guard asks for before the limit".
 
 ## Installing a build on the VM (for the orchestrator)
 

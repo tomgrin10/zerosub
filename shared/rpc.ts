@@ -112,6 +112,24 @@ export const setAccountEnabled = defineRpc({
   }),
 });
 
+/**
+ * Moves one agent, between turns, to the named account before its own account is out. For Session
+ * Guard, which holds a session at its own threshold (below ZeroSub's 100%): instead of holding it
+ * while another account has room, it asks for this move. ZeroSub's own guards apply.
+ */
+export const moveBeforeLimit = defineRpc({
+  name: "zerosub.agents.move_before_limit",
+  input: z.object({ agentId: z.string(), accountId: z.string() }),
+  output: z.object({
+    /**
+     * `moved`: it runs on the account now. `waiting`: it moves once its turn or background jobs end.
+     * `already`: it was there. `refused`: not moved; `detail` says why.
+     */
+    outcome: z.enum(["moved", "waiting", "already", "refused"]),
+    detail: z.string().nullable(),
+  }),
+});
+
 /** Carries an agent's work on in a new agent on the other provider (Claude ↔ ChatGPT). */
 export const forkAgent = defineRpc({
   name: "zerosub.agents.fork",

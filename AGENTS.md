@@ -31,6 +31,16 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
 - Never touch the live daemon, `~/.paseo/zerosub` or live credentials from tests or harnesses; use an isolated
   harness daemon with synthetic accounts.
 
+## Invariants
+
+- **A move toward an agent's binding is never lost.** The saved binding, not memory, decides where a live portable
+  agent belongs. A move that waits (busy turn, background jobs, a held process) is kept in memory only as a hint;
+  upkeep (`moveDrifted`, every minute) finds any live agent whose session runs elsewhere than its own binding,
+  where routing would put it now, and moves it once it's between turns. Guards: never a closed or archived agent,
+  never one with background jobs or a stopped process, never a one-shot helper or a Codex thread, at most one such
+  move per agent in 10 minutes; a limited, signed-out or disabled bound account is left to the limit paths.
+  Tests: "a waiting move survives a plugin reload" in `server/failover.test.ts`.
+
 ## Installing a build on the VM (for the orchestrator)
 
 Use the script; don't run the steps by hand:

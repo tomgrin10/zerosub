@@ -1418,3 +1418,90 @@ describe("an account a usage reading finds full (2026-11-12: Extra usage on, so 
     expect(reopened).toEqual([]);
   });
 });
+
+// Seam A (2026-11-12): a move that waited (busy turn, background jobs, a held process) lived only in
+// memory. A plugin reload dropped it, and the agent stayed on the old account for good while its
+// binding named another. Upkeep now finds such drift from the saved state and finishes the move.
+describe("a waiting move survives a plugin reload", () => {
+  const drifted = (extra: Partial<StoredState> = {}) => ({
+    accounts: [account(MAIN, "main", "main"), account(HELLO, "seat", "managed")] as never,
+    defaults: { claude: MAIN, codex: null },
+    bindings: { [AGENT]: { accountId: HELLO, source: "user" as const, at: new Date().toISOString() } },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: new Date().toISOString() } },
+    ...extra,
+  });
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+
+  it("moves an idle agent whose session runs elsewhere than its own binding", async () => {
+    // A fresh Service is what a reload leaves: nothing in memory, only the saved state.
+    const { service, store, reopened, notes, paseo } = await setUp(drifted(), unused);
+    service.attach(paseo as never);
+    await service.moveDrifted();
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ from: "main", to: "seat", reason: "manual", outcome: "switched" });
+  });
+
+  it("is part of upkeep", async () => {
+    const { service, reopened, paseo } = await setUp(drifted(), unused);
+    service.attach(paseo as never);
+    await (service as unknown as { tick(): Promise<void> }).tick();
+    await vi.waitFor(() => expect(reopened).toEqual([AGENT]));
+  });
+
+  it("waits for a busy agent's turn, and never wakes a closed one", async () => {
+    const { service, reopened, paseo, agent } = await setUp(drifted(), unused);
+    service.attach(paseo as never);
+    agent.status = "running";
+    await service.moveDrifted();
+    agent.status = "closed";
+    await service.moveDrifted();
+    expect(reopened).toEqual([]);
+    agent.status = "idle";
+    await service.moveDrifted();
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("never moves an agent with background jobs", async () => {
+    const { service, reopened, paseo, agent } = await setUp(drifted(), unused);
+    service.attach(paseo as never);
+    (agent as Record<string, unknown>).backgroundWork = { count: 1 };
+    await service.moveDrifted();
+    expect(reopened).toEqual([]);
+  });
+
+  it("moves an agent at most once in 10 minutes", async () => {
+    const { service, store, reopened, paseo } = await setUp(drifted(), unused);
+    service.attach(paseo as never);
+    await service.moveDrifted();
+    // Something put it back (a reload that failed, say): no second move inside the window.
+    await store.update((draft) => {
+      draft.sessions[AGENT] = { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() };
+    });
+    await service.moveDrifted();
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("leaves it where it is when its own account can't take it now, or it's a one-shot helper", async () => {
+    const limited = await setUp(
+      drifted({ accounts: [account(MAIN, "main", "main"), { ...account(HELLO, "seat", "managed"), limitedUntil: inFuture() }] as never }),
+      unused,
+    );
+    limited.service.attach(limited.paseo as never);
+    await limited.service.moveDrifted();
+    expect(limited.reopened).toEqual([]);
+
+    const helper = await setUp(drifted(), unused);
+    helper.service.attach(helper.paseo as never);
+    (helper.agent as Record<string, unknown>).labels = { "smart-session.helper": "publish-as" };
+    await helper.service.moveDrifted();
+    expect(helper.reopened).toEqual([]);
+  });
+
+  it("leaves an agent that follows the default alone", async () => {
+    const { service, reopened, paseo } = await setUp(drifted({ bindings: {} }), unused);
+    service.attach(paseo as never);
+    await service.moveDrifted();
+    expect(reopened).toEqual([]);
+  });
+});

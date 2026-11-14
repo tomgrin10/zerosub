@@ -1505,3 +1505,72 @@ describe("a waiting move survives a plugin reload", () => {
     expect(reopened).toEqual([]);
   });
 });
+
+// Seam C (2026-11-12): Session Guard holds a session at its own threshold (95%, say), below ZeroSub's
+// 100%. While another account had room, the guard waited for ZeroSub to move the session, and ZeroSub
+// never did: to ZeroSub the account wasn't out yet. So the guard asks: `moveBeforeLimit` moves this one
+// agent, between turns, to the account the guard names, with ZeroSub's own guards.
+describe("a move Session Guard asks for before the limit", () => {
+  const nearly = (extra: Partial<StoredState> = {}) => ({
+    accounts: [account(MAIN, "main", "main"), account(HELLO, "seat", "managed")] as never,
+    defaults: { claude: MAIN, codex: null },
+    sessions: { [AGENT]: { accountId: MAIN, family: "claude" as const, openedAt: new Date().toISOString() } },
+    ...extra,
+  });
+  const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+
+  it("moves an idle agent to the named account, which it then follows", async () => {
+    const { service, store, reopened, notes, paseo } = await setUp(nearly(), unused);
+    const result = await service.moveBeforeLimit(paseo as never, AGENT, HELLO);
+    expect(result.outcome).toBe("moved");
+    expect(reopened).toEqual([AGENT]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(state.bindings[AGENT]).toMatchObject({ accountId: HELLO, source: "auto" });
+    expect(notes.at(-1)).toMatchObject({ from: "main", to: "seat", reason: "near_limit", outcome: "switched" });
+  });
+
+  it("says so when it's already there, and does nothing", async () => {
+    const { service, reopened, paseo } = await setUp(nearly(), unused);
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, MAIN)).outcome).toBe("already");
+    expect(reopened).toEqual([]);
+  });
+
+  it("waits for background jobs and a running turn", async () => {
+    const jobs = await setUp(nearly(), unused);
+    (jobs.agent as Record<string, unknown>).backgroundWork = { count: 2 };
+    expect((await jobs.service.moveBeforeLimit(jobs.paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect(jobs.reopened).toEqual([]);
+    const busy = await setUp(nearly(), unused);
+    busy.agent.status = "running";
+    expect((await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect(busy.reopened).toEqual([]);
+  });
+
+  it("refuses an account that can't take it, a closed agent, a helper, and automatic switching off", async () => {
+    const limited = await setUp(nearly({ accounts: [account(MAIN, "main", "main"), { ...account(HELLO, "seat", "managed"), limitedUntil: inFuture() }] as never }), unused);
+    expect((await limited.service.moveBeforeLimit(limited.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    const closed = await setUp(nearly(), unused);
+    closed.agent.status = "closed";
+    expect((await closed.service.moveBeforeLimit(closed.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    const helper = await setUp(nearly(), unused);
+    (helper.agent as Record<string, unknown>).labels = { "smart-session.helper": "publish-as" };
+    expect((await helper.service.moveBeforeLimit(helper.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    const off = await setUp(nearly(), unused);
+    off.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
+    expect((await off.service.moveBeforeLimit(off.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    for (const run of [limited, closed, helper, off]) expect(run.reopened).toEqual([]);
+  });
+
+  it("keeps the bounce guard", async () => {
+    const { service, store, paseo } = await setUp(nearly(), unused);
+    const back = async () => store.update((draft) => {
+      draft.sessions[AGENT] = { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() };
+    });
+    for (let move = 0; move < 4; move += 1) {
+      expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("moved");
+      await back();
+    }
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+  });
+});

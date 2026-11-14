@@ -33,4 +33,8 @@ describe("the switch note", () => {
       "Back on alice@example.com, the default, now that weekly pacing is off.",
     );
   });
+
+  it("says a move before the limit was because the account is nearly full", () => {
+    expect(describeRow(row({ reason: "near_limit", from: "main", to: "seat" }))).toBe("main is nearly at its usage limit. Switched to seat.");
+  });
 });

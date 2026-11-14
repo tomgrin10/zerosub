@@ -29,6 +29,8 @@ export const SwitchRowSchema = z.object({
     "pace",
     /** Pacing was turned off, and this agent follows the default again. */
     "pace_off",
+    /** `from` is nearly at its limit, and Session Guard asked to move the agent before it got there. */
+    "near_limit",
   ]),
   /** When the exhausted account frees up again, if known. */
   resetsAt: z.string().nullable(),

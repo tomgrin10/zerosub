@@ -80,6 +80,17 @@ export const BindingSchema = z.object({
 });
 export type Binding = z.infer<typeof BindingSchema>;
 
+/**
+ * A binding as the registry stores it. The 1.5.1-pace fork bound agents with `source: "pace"` (placed
+ * or moved to pace weekly usage across accounts); such an agent was spread by usage, so it reads as
+ * `balance` with `headroom` and is written back that way. Without this, one such binding would make
+ * the whole registry invalid and every one of them would be dropped.
+ */
+export const StoredBindingSchema = z.preprocess(
+  (value) => (isRecord(value) && value.source === "pace" ? { ...value, source: "balance", selectionReason: "headroom" } : value),
+  BindingSchema,
+);
+
 export const LiveSessionSchema = z.object({
   accountId: z.string(),
   family: FamilySchema,
@@ -238,7 +249,7 @@ export const StoredStateSchema = z.object({
     })
     .default({ claude: null, codex: null, pi: null }),
   /** Per-agent overrides of the default account. */
-  bindings: z.record(z.string(), BindingSchema).default({}),
+  bindings: z.record(z.string(), StoredBindingSchema).default({}),
   /** Which account each agent's live provider session was opened with. */
   sessions: z.record(z.string(), LiveSessionSchema).default({}),
   continuations: z.record(z.string(), ContinuationChainSchema).default({}),
@@ -306,7 +317,7 @@ export function salvageState(raw: unknown): { state: StoredState; dropped: boole
       version: 1,
       accounts,
       defaults,
-      bindings: records(BindingSchema, source.bindings),
+      bindings: records(StoredBindingSchema, source.bindings),
       sessions: records(LiveSessionSchema, source.sessions),
       continuations: records(ContinuationChainSchema, source.continuations),
       opencodeForks: records(OpenCodeForkSchema, source.opencodeForks),

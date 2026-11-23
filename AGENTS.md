@@ -45,7 +45,15 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
   that one agent, between turns, to the account the guard names (binding `auto`, timeline reason `near_limit`).
   ZeroSub's guards apply: automatic switching on, a usable target, a portable open agent that isn't a one-shot
   helper, the bounce guard, and `reopenAgent` (never wakes a closed agent; waits for a turn, background jobs or a
-  stopped process, and answers `waiting`). Tests: "a move Session Guard asks for before the limit".
+  stopped process, and answers `waiting` with `waitingFor` and the jobs it waits for). Never a session the user
+  pinned (`source: user`). Asking again for a move that already waits isn't counted against the bounce guard.
+  Tests: "a move Session Guard asks for before the limit".
+- **A move stops background work only when its caller asked for exactly that.** `move_before_limit` with
+  `stopBackgroundWork: true` stops the jobs Paseo can stop (`backgroundWork.stop`, Paseo 0.17+), reopens, and returns
+  every job the move ended in `stopped` (kind, description, command), so the caller can tell the agent what to start
+  again. No other path stops jobs. Work the daemon owns (ids `daemon:…`: heartbeats, change-request watches) outlives
+  a reopen, so it never holds a move back (`workAReopenEnds`); on a Paseo that can't list work, the snapshot's count
+  and the shell scan decide as before.
 
 ## Installing a build on the VM (for the orchestrator)
 

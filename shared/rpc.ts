@@ -112,6 +112,15 @@ export const setAccountEnabled = defineRpc({
   }),
 });
 
+/** One piece of background work an agent left running after its turn, as Paseo describes it. */
+export const BackgroundJobSchema = z.object({
+  /** Paseo's kind: `shell`, `monitor` (a watcher), or `other`. */
+  kind: z.string(),
+  description: z.string().nullable(),
+  command: z.string().nullable(),
+});
+export type BackgroundJob = z.infer<typeof BackgroundJobSchema>;
+
 /**
  * Moves one agent, between turns, to the named account before its own account is out. For Session
  * Guard, which holds a session at its own threshold (below ZeroSub's 100%): instead of holding it
@@ -119,7 +128,16 @@ export const setAccountEnabled = defineRpc({
  */
 export const moveBeforeLimit = defineRpc({
   name: "zerosub.agents.move_before_limit",
-  input: z.object({ agentId: z.string(), accountId: z.string() }),
+  input: z.object({
+    agentId: z.string(),
+    accountId: z.string(),
+    /**
+     * Move now even though the agent has background work: stop the jobs Paseo can stop, then reopen
+     * it (which ends the rest). Off by default: a move waits for its background work to end.
+     * Work the daemon owns (heartbeats, change-request watches) outlives a reopen and never blocks one.
+     */
+    stopBackgroundWork: z.boolean().optional(),
+  }),
   output: z.object({
     /**
      * `moved`: it runs on the account now. `waiting`: it moves once its turn or background jobs end.
@@ -127,6 +145,15 @@ export const moveBeforeLimit = defineRpc({
      */
     outcome: z.enum(["moved", "waiting", "already", "refused"]),
     detail: z.string().nullable(),
+    /**
+     * Why a `waiting` move waits: a running `turn`, `background` work, or a provider process that is
+     * `held` (stopped). Null otherwise.
+     */
+    waitingFor: z.enum(["turn", "background", "held"]).nullable().default(null),
+    /** The background work a `waiting` move waits for (`waitingFor: background`). */
+    backgroundWork: z.array(BackgroundJobSchema).default([]),
+    /** The background work a `moved` agent had, which `stopBackgroundWork` stopped (or the reopen ended). */
+    stopped: z.array(BackgroundJobSchema).default([]),
   }),
 });
 

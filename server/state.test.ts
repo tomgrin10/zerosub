@@ -80,6 +80,55 @@ describe("StateStore", () => {
   });
 });
 
+describe("a registry the 1.5.1-pace fork wrote", () => {
+  // The fork bound agents with `source: "pace"` and kept a top-level `pace` record. Neither exists
+  // here, and a binding that doesn't validate would be dropped with the registry kept aside.
+  const forkState = () => ({
+    version: 1,
+    accounts: [account, { ...account, id: "claude-work", label: "work", kind: "managed", home: "/home/user/work" }],
+    defaults: { claude: "claude-main", codex: null, pi: null },
+    bindings: {
+      paced: { accountId: "claude-work", source: "pace", at: "2026-11-19T10:00:00.000Z" },
+      pinned: { accountId: "claude-main", source: "user", at: "2026-11-19T10:00:00.000Z" },
+      spread: { accountId: "claude-main", source: "balance", at: "2026-11-19T10:00:00.000Z", selectionReason: "weekly_reset" },
+    },
+    sessions: {},
+    continuations: {},
+    pace: { lastMoveAt: "2026-11-19T10:00:00.000Z", routedByHand: { pinned: "2026-11-19T10:00:00.000Z" } },
+  });
+
+  it("loads whole, every pace binding kept as one spread by usage", async () => {
+    const path = join(dir, "state.json");
+    await writeFile(path, JSON.stringify(forkState()));
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const state = await new StateStore(path).read();
+    expect(state.bindings).toEqual({
+      paced: { accountId: "claude-work", source: "balance", at: "2026-11-19T10:00:00.000Z", selectionReason: "headroom" },
+      pinned: { accountId: "claude-main", source: "user", at: "2026-11-19T10:00:00.000Z" },
+      spread: { accountId: "claude-main", source: "balance", at: "2026-11-19T10:00:00.000Z", selectionReason: "weekly_reset" },
+    });
+    expect(state.accounts.map((entry) => entry.id)).toEqual(["claude-main", "claude-work"]);
+    expect(errors).not.toHaveBeenCalled();
+    expect((await readdir(dir)).filter((name) => name.includes(".bad-"))).toEqual([]);
+  });
+
+  it("salvages pace bindings too, and writes them back in this version's shape", async () => {
+    expect(salvageState({ ...forkState(), accounts: [account, { id: "broken" }] }).state.bindings.paced).toEqual({
+      accountId: "claude-work",
+      source: "balance",
+      at: "2026-11-19T10:00:00.000Z",
+      selectionReason: "headroom",
+    });
+    const path = join(dir, "state.json");
+    await writeFile(path, JSON.stringify(forkState()));
+    const store = new StateStore(path);
+    await store.update(() => undefined);
+    const written = JSON.parse(await readFile(path, "utf8"));
+    expect(written.bindings.paced.source).toBe("balance");
+    expect(written.pace).toBeUndefined();
+  });
+});
+
 describe("StateStore backups", () => {
   const path = () => join(dir, "state.json");
   const backups = () => join(dir, "backups");

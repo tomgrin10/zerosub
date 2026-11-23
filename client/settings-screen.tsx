@@ -9,6 +9,8 @@ import {
 import { useState } from "react";
 import { Text } from "react-native";
 import { DEFAULT_CONTINUE_PROMPT, preferences, type Preferences } from "../shared/preferences";
+import { ComposerPillRows } from "./composer-settings";
+import { ForkDestinationRows, OpenCodeForkRows } from "./fork-settings";
 
 /** Settings → Plugins → zerosub. Accounts themselves live in the sidebar surface. */
 export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurfaceProps & { onOpenAccounts(): void }) {
@@ -66,20 +68,6 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             disabled={settings.saving}
             onValueChange={(moveAgentsOnDefaultChange) => save({ moveAgentsOnDefaultChange })}
           />
-          <SettingsSwitch
-            label="Pace weekly usage"
-            hint="New Claude agents start on the account whose weekly limit would otherwise reset unused, and recently used idle ones move there one at a time; agents you placed yourself stay put."
-            value={settings.values.paceWeeklyUsage}
-            disabled={settings.saving}
-            onValueChange={(paceWeeklyUsage) => save({ paceWeeklyUsage })}
-          />
-          <SettingsSwitch
-            label="Stop stray agent processes"
-            hint="Paseo can leave an agent with an extra Claude or Codex process nothing uses. ZeroSub stops one that's on another account or has sat idle for 10 minutes, never the one the agent is using, and never mid-turn."
-            value={settings.values.reapDetachedDuplicates}
-            disabled={settings.saving}
-            onValueChange={(reapDetachedDuplicates) => save({ reapDetachedDuplicates })}
-          />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection title="Automatic switching">
@@ -93,9 +81,9 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
           />
           <SettingsSwitch
             label="Keep going after a switch"
-            hint="Sends the follow-up below so the interrupted task continues."
+            hint="Sends the follow-up below so the interrupted task continues, also after you use a banked reset. Off, a ChatGPT task that hits its limit stays where it stopped, since carrying it on means starting it in another tab."
             value={settings.values.autoContinue}
-            disabled={settings.saving || !settings.values.autoSwitch}
+            disabled={settings.saving}
             onValueChange={(autoContinue) => save({ autoContinue })}
           />
           <SettingsInput
@@ -146,19 +134,33 @@ export function PreferencesScreen({ theme, host, onOpenAccounts }: PluginSurface
             onValueChange={(useCredits) => save({ useCredits })}
           />
           <SettingsSwitch
+            label="Use paid API accounts when every subscription is out"
+            hint="Off unless you turn it on. When every subscription account of a provider is at its limit, signed out or disabled, agents may move to an Azure OpenAI account (ChatGPT), or an AWS Bedrock account or a Claude API key or token on Anthropic's own API (Claude), billed per use (after a banked reset, if those are used automatically), and Claude agents move back once a subscription has room. Off, those are used only as the default or when you pick one for an agent. Pi accounts never stand in."
+            value={settings.values.paidApiFallback}
+            disabled={settings.saving}
+            onValueChange={(paidApiFallback) => save({ paidApiFallback })}
+          />
+          <SettingsSwitch
             label="When every account is out, fork the chat to the other provider"
-            hint="A stopped Claude chat carries on in a new ChatGPT agent, or the other way round, with the conversation so far and no more permissions than the original. The original stays as it was."
+            hint="A stopped Claude chat carries on in a new ChatGPT or OpenCode agent (pick the destination below) with the conversation so far. ChatGPT gets a mode no looser than this agent's. OpenCode gets Plan or Build under the host's own permission policy, which can allow more than Claude does. The original stays as it was."
             value={settings.values.forkOtherProvider}
             disabled={settings.saving || !settings.values.autoSwitch}
             onValueChange={(forkOtherProvider) => save({ forkOtherProvider })}
           />
+          <ForkDestinationRows values={settings.values} saving={settings.saving} onSave={save} />
           <SettingsSwitch
-            label="Show the account pill in the composer"
-            hint="Appears on Claude and Codex agents once a provider has two or more accounts."
-            value={settings.values.showComposerPill}
-            disabled={settings.saving}
-            onValueChange={(showComposerPill) => save({ showComposerPill })}
+            label="Keep a Codex chat in the same conversation"
+            hint="Off unless you turn it on. Two ChatGPT accounts in one workspace reload this agent on the other account instead of opening a new tab. A different workspace, an email-only account, or a workspace that is out of credits still opens a new tab. If the first turn cannot resume the thread, this agent goes back and the new tab opens."
+            value={settings.values.codexSameConversation}
+            disabled={settings.saving || !settings.values.autoSwitch}
+            onValueChange={(codexSameConversation) => save({ codexSameConversation })}
           />
+          <ComposerPillRows values={settings.values} saving={settings.saving} onSave={save} />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection title="Continue on OpenCode">
+        <SettingsCard>
+          <OpenCodeForkRows values={settings.values} saving={settings.saving} onSave={save} />
         </SettingsCard>
       </SettingsSection>
     </>

@@ -30,7 +30,7 @@ describe("Claude extra usage", () => {
     expect(
       parseExtraUsage({ is_enabled: true, monthly_limit: 5000, used_credits: 1234, utilization: 24.7, currency: "USD" }),
     ).toEqual({ enabled: true, spend: 1234, limit: 5000, currency: "USD" });
-    // The read ZeroSub makes asks Anthropic to skip spend, so the amounts may be missing.
+    // The amounts may be missing, e.g. from the fallback read without spend.
     expect(parseExtraUsage({ is_enabled: false, monthly_limit: null, used_credits: null })).toEqual({
       enabled: false, spend: null, limit: null, currency: null,
     });
@@ -120,7 +120,8 @@ describe("hand-off transcript", () => {
       ...Array.from({ length: 200 }, (_, index): AgentTimelineItem => ({ type: "assistant_message", text: `step ${index} ${"x".repeat(200)}` })),
     ];
     const transcript = buildTranscript(long, 5_000);
-    expect(transcript.startsWith("User (original request): The original task.")).toBe(true);
+    // The only user message is also the latest instruction, so it goes last, after the progress.
+    expect(transcript.endsWith("User (original request and latest instruction): The original task.")).toBe(true);
     expect(transcript).toContain("[… earlier conversation omitted …]");
     expect(transcript).toContain("step 199");
     expect(transcript.length).toBeLessThan(5_500);

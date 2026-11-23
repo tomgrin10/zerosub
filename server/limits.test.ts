@@ -7,6 +7,7 @@ import {
   detectCodexSignOut,
   parseClaudeReset,
   parseCodexReset,
+  turnRows,
 } from "./limits";
 
 const completed = { kind: "completed" } as const;
@@ -37,13 +38,33 @@ describe("detectClaudeLimit", () => {
       const notice = `You${apostrophe}ve hit your 5-hour limit · resets 7pm (America/Sao_Paulo)`;
       const hit = detectClaudeLimit({ outcome: completed, timeline: turn("Working on it.", notice) }, NOW);
       // 7pm in São Paulo (UTC-3), whatever the daemon's own zone.
-      expect(hit).toEqual({ message: notice, kind: "window", resetsAt: "2026-09-23T22:00:00.000Z" });
+      expect(hit).toEqual({ message: notice, kind: "window", resetsAt: "2026-09-23T22:00:00.000Z", scope: null });
     }
     const saved = detectClaudeLimit(
       { outcome: completed, timeline: turn("You've hit your 5-hour limit · resets 3pm (Asia/Kolkata) · progress saved") },
       NOW,
     );
     expect(saved).toMatchObject({ kind: "window", resetsAt: "2026-09-23T09:30:00.000Z" });
+  });
+
+  it("names the model of a model limit, and no scope for a limit of the account", () => {
+    const scopeOf = (notice: string) => detectClaudeLimit({ outcome: completed, timeline: turn(notice) }, NOW)?.scope;
+    expect(scopeOf("You've hit your Fable limit · resets 4:30am (UTC)")).toBe("fable");
+    expect(scopeOf("You've hit your Opus limit · resets 4:30am (UTC)")).toBe("opus");
+    expect(scopeOf("You’ve hit your Sonnet limit")).toBe("sonnet");
+    expect(scopeOf("You've reached your Fable limit.")).toBe("fable");
+    expect(scopeOf("You've reached your Fable 5.2 limit · resets 3pm (UTC)")).toBe("fable");
+    expect(scopeOf("You've reached your Haiku limit")).toBe("haiku");
+    for (const notice of [
+      "You've hit your 5-hour limit · resets 3pm (UTC)",
+      "You've hit your session limit · resets 3pm (UTC)",
+      "You've hit your weekly limit · resets Sep 25, 3pm (UTC)",
+      "You've hit your limit · resets 3pm (UTC)",
+      "You've hit your usage limit",
+      "Claude AI usage limit reached|1790150000",
+    ]) {
+      expect(scopeOf(notice)).toBeNull();
+    }
   });
 
   it("recognises weekly and model limits with a date", () => {
@@ -90,6 +111,45 @@ describe("detectClaudeLimit", () => {
       { type: "assistant_message", text: "Done." },
     ];
     expect(detectClaudeLimit({ outcome: completed, timeline }, NOW)).toBeNull();
+  });
+
+  it("stops at an agent_message or scheduled heartbeat prompt when isolating the latest turn", () => {
+    const agentTurnPrompt = {
+      type: "tool_call",
+      callId: "paseo-agent-message:msg-2",
+      name: "agent_message",
+      status: "completed",
+      error: null,
+      agentMessage: { event: "message", sender: { id: "lead", title: "Lead" }, text: "continue" },
+      detail: { type: "plain_text", text: "continue", icon: "bot" },
+    } as AgentTimelineItem;
+    const heartbeatTurnPrompt = {
+      type: "tool_call",
+      callId: "paseo-system:run-2",
+      name: "heartbeat",
+      status: "completed",
+      error: null,
+      detail: { type: "plain_text", text: "run check", icon: "sparkles" },
+    } as AgentTimelineItem;
+
+    for (const prompt of [agentTurnPrompt, heartbeatTurnPrompt]) {
+      const timeline: AgentTimelineItem[] = [
+        ...turn("You've hit your session limit · resets 3pm (Asia/Kolkata)"),
+        prompt,
+        { type: "assistant_message", text: "Done." },
+      ];
+      expect(detectClaudeLimit({ outcome: completed, timeline }, NOW)).toBeNull();
+    }
+
+    // Reopened sessions count turn IDs from 1 again; an intervening agent-prompted turn still separates them.
+    const entries = [
+      { turnId: "1", item: { type: "assistant_message", text: "You've hit your session limit · resets 3pm (Asia/Kolkata)" } as AgentTimelineItem },
+      { turnId: "2", item: agentTurnPrompt },
+      { turnId: "2", item: { type: "assistant_message", text: "Intermediate work." } as AgentTimelineItem },
+      { turnId: "1", item: agentTurnPrompt },
+      { turnId: "1", item: { type: "assistant_message", text: "New session turn." } as AgentTimelineItem },
+    ];
+    expect(turnRows(entries, "1")).toEqual([agentTurnPrompt, { type: "assistant_message", text: "New session turn." }]);
   });
 
   it("recognises every wording Claude Code 2.1.280 uses", () => {
@@ -255,6 +315,11 @@ describe("sign-in failures", () => {
     expect(detectClaudeSignOut({ outcome: completed, timeline: turn("Not logged in · Please run /login") })).not.toBeNull();
     expect(
       detectClaudeSignOut({ outcome: completed, timeline: turn("Failed to authenticate. API Error: 401 OAuth access token is invalid.") }),
+    ).not.toBeNull();
+    // Its token couldn't be renewed: maybe signed out, maybe another process renewed it first. The
+    // account is only signed out once its sign-in is read again (see `confirmSignedOut`).
+    expect(
+      detectClaudeSignOut({ outcome: completed, timeline: turn("Failed to authenticate: OAuth session expired and could not be refreshed") }),
     ).not.toBeNull();
     expect(detectClaudeSignOut({ outcome: completed, timeline: turn("The login form now validates emails.") })).toBeNull();
   });

@@ -4,20 +4,34 @@ import { join } from "node:path";
 import type { PluginHookContext } from "@getpaseo/plugin/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTimelineItem, FamilyAdapter } from "./adapter";
-import { CodexContinuations, fitInstructions } from "./continuations";
+import { CodexContinuations, fitInstructions, readUpdates } from "./continuations";
 import { Service } from "./service";
 import { StateStore, StoredAccountSchema, salvageState } from "./state";
 import type { FamilyResolver } from "./families";
 import { preferences } from "../shared/preferences";
 import type { SwitchRow } from "../shared/timeline";
+import { absentPi } from "./fakes.test-support";
 
 type PaseoApi = PluginHookContext["paseo"];
 type Create = Parameters<ReturnType<PaseoApi["workspaces"]["ref"]>["agents"]["create"]>[0];
 type Snapshot = NonNullable<Awaited<ReturnType<ReturnType<PaseoApi["agents"]["ref"]>["refresh"]>>>["agent"];
 type Entry = { item: AgentTimelineItem; timestamp: string; seqStart: number; seqEnd: number; turnId?: string };
 let dir: string;
-beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-")); });
-afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+/** The services the current test made, stopped once it ends. */
+const services: Service[] = [];
+let previousLaunchers: string | undefined;
+beforeEach(async () => {
+  dir = await mkdtemp(join(tmpdir(), "zerosub-continuations-"));
+  previousLaunchers = process.env.ZEROSUB_LAUNCHER_DIR;
+  process.env.ZEROSUB_LAUNCHER_DIR = join(dir, "launchers");
+});
+afterEach(async () => {
+  await Promise.all(services.splice(0).map((service) => service.stop()));
+  if (previousLaunchers === undefined) delete process.env.ZEROSUB_LAUNCHER_DIR;
+  else process.env.ZEROSUB_LAUNCHER_DIR = previousLaunchers;
+  // Retried: a write the test set off in the background can still be landing in it.
+  await rm(dir, { recursive: true, force: true, maxRetries: 5 });
+});
 
 async function setup() {
   const path = join(dir, "state.json");
@@ -106,7 +120,11 @@ async function setup() {
     detectSignOut: () => null, env: async (home: string) => ({ CODEX_HOME: home }), prepareHome: async () => {},
     redeemReset: async () => ({ outcome: "reset", message: "Synthetic reset", left: 0 }),
   } as unknown as FamilyAdapter;
-  const service = () => new Service({ codex: adapter, claude: adapter }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+  const service = () => {
+    const made = new Service({ codex: adapter, claude: adapter, pi: absentPi() }, store, { resolve: async () => ({ codex: "codex" }) } as unknown as FamilyResolver);
+    services.push(made);
+    return made;
+  };
   const restart = () => { store = new StateStore(path); return new CodexContinuations(store); };
   return { path, get store() { return store; }, accounts, agents, addAgent, timelines, epochs, add, created, sent, notes, create, send, refetch, paseo, switchTo, manager, service, restart };
 }
@@ -280,6 +298,28 @@ describe("Codex account continuations", () => {
     expect(t.sent.at(-1)?.text).toContain("Current user correction before the limit");
   });
 
+  it("counts a limit hand-off to a new tab once, as that tab opens, and a stay not at all", async () => {
+    const pending = (service: Service) =>
+      ["a", "b", "c"].reduce((sum, id) => sum + (service as unknown as { pendingOn(id: string, now: number): number }).pendingOn(id, Date.now()), 0);
+    const t = await setup();
+    const service = t.service();
+    const limit = { agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] };
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true, autoContinue: false }));
+    await service.onTurnEnded(limit as never, { paseo: t.paseo } as never);
+    expect(t.created).toHaveLength(0);
+    expect(pending(service)).toBe(0);
+    service.setPreferences(preferences.schema.parse({ balanceNewAgents: true }));
+    await service.onTurnEnded({ ...limit, turnId: "limit-turn-2" } as never, { paseo: t.paseo } as never);
+    expect(t.created).toHaveLength(1);
+    expect(pending(service)).toBe(0);
+    const tab = t.created[0]!.agentId!;
+    await service.onSessionOpen(
+      { agentId: tab, provider: "codex", reason: "create", purpose: "interactive", workspaceId: "workspace-1", env: {} } as never,
+      { paseo: t.paseo } as never,
+    );
+    expect(pending(service)).toBe(1);
+  });
+
   it("continues an account-limit turn in error status into an available account's existing error-status tab", async () => {
     const t = await setup();
     const service = t.service();
@@ -303,13 +343,50 @@ describe("Codex account continuations", () => {
     const switching = service.setAgentAccount(t.paseo, "root", "b");
     await entered;
     await expect(service.forkAgent(t.paseo, "root")).rejects.toThrow(/already switching/);
-    await service.onTurnEnded({ agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] } as never, { paseo: t.paseo } as never);
+    // The limit waits for the switch, which continues the task once: failover then finds it continued.
+    const limited = service.onTurnEnded({ agent: t.agents.get("root"), turnId: "limit-turn", outcome: { kind: "failed" }, timeline: [] } as never, { paseo: t.paseo } as never);
+    await vi.waitFor(async () => expect((await t.store.read()).accounts.find((account) => account.id === "a")!.limitedUntil).not.toBeNull());
     release();
     await switching;
+    await limited;
     expect(t.created).toHaveLength(1);
     expect(t.send).toHaveBeenCalledTimes(1);
     expect((await t.store.read()).accounts.find((account) => account.id === "a")!.limitedUntil).not.toBeNull();
     expect((await t.store.read()).accounts.find((account) => account.id === "b")!.limitedUntil).toBeNull();
+  });
+
+  it.each([
+    ["finishes it", null, { outcome: "continued", to: "B", continued: true }],
+    ["says so when it can't finish it", new Error("The workspace is gone"), { outcome: "stayed", to: "B", detail: "Couldn't continue on B: The workspace is gone" }],
+  ])("answers a switch before Paseo gives up, and %s in the background", async (_, failure, row) => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const t = await setup();
+      const service = t.service();
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      let release!: () => void;
+      let started!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const entered = new Promise<void>((resolve) => { started = resolve; });
+      const create = t.create.getMockImplementation()!;
+      t.create.mockImplementationOnce(async (request) => {
+        started();
+        await gate;
+        if (failure) throw failure;
+        await create(request);
+      });
+      const switching = service.setAgentAccount(t.paseo, "root", "b");
+      await entered;
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(await switching).toMatchObject({ pending: ["root"], continuedIn: null });
+      expect(t.notes).toEqual([]);
+
+      release();
+      await vi.waitFor(() => expect(t.notes.at(-1)).toMatchObject({ agentId: "root", row }));
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    }
   });
 
   it("does not send a snapshot made before a newer source instruction", async () => {
@@ -968,6 +1045,115 @@ describe("Codex continuations of a sub-agent", () => {
     expect(t.created.find((request) => request.agentId === b.agentId)!.labels).toEqual({ [FROM]: "root", [PARENT]: "lead" });
     expect((await t.store.read()).continuations.root!.pending).toBeUndefined();
   });
+
+  function agentMessage(
+    text: string,
+    options: { event?: string; id?: string; title?: string; legacy?: boolean } = {},
+  ): AgentTimelineItem {
+    const { event = "message", id = "lead", title = "Lead the release", legacy = false } = options;
+    return {
+      type: "tool_call",
+      callId: `paseo-agent-message:${id}-${Math.random().toString(36).slice(2)}`,
+      name: "agent_message",
+      status: "completed",
+      error: null,
+      ...(!legacy
+        ? {
+            agentMessage: {
+              event,
+              sender: { id, ...(title ? { title } : {}) },
+              text,
+            },
+          }
+        : {}),
+      detail: { type: "plain_text", text, icon: "bot" },
+    } as AgentTimelineItem;
+  }
+
+  function heartbeat(text: string): AgentTimelineItem {
+    return {
+      type: "tool_call",
+      callId: "paseo-system:nightly-check",
+      name: "heartbeat",
+      status: "completed",
+      error: null,
+      detail: { type: "plain_text", text, icon: "sparkles" },
+    } as AgentTimelineItem;
+  }
+
+  it("continues a sub-agent whose instructions came only from its orchestrator, across tabs and fallback", async () => {
+    const t = await setup();
+    await withLead(t);
+    // Paseo projects agent-to-agent prompts as tool_call items and leaves lastUserMessageAt null.
+    t.timelines.set("root", []);
+    t.agents.get("root")!.lastUserMessageAt = null;
+    t.add("root", agentMessage("Implement the parser for the new wire format."));
+    t.add("root", { type: "assistant_message", text: "Lexer is done; parser AST next." });
+
+    const b = await t.switchTo("root", "b");
+    const firstHandoff = t.sent.at(-1)!.text;
+    expect(firstHandoff).toContain("<user-updates>\nFrom Lead the release (lead):\nImplement the parser for the new wire format.\n</user-updates>");
+    expect(firstHandoff).toContain("<progress-updates>\nAssistant: Lexer is done; parser AST next.\n</progress-updates>");
+    expect(firstHandoff).not.toContain("[agent_message]");
+
+    t.add(b.agentId, agentMessage("Skip benchmarks; only unit tests."));
+    t.add(b.agentId, { type: "assistant_message", text: "Unit tests added." });
+    expect((await t.switchTo(b.agentId, "a")).agentId).toBe("root");
+    const returnHandoff = t.sent.at(-1)!.text;
+    expect(returnHandoff).toContain("<user-updates>\nFrom Lead the release (lead):\nSkip benchmarks; only unit tests.\n</user-updates>");
+    expect(returnHandoff).toContain("<progress-updates>\nAssistant: Unit tests added.\n</progress-updates>");
+    expect(returnHandoff).not.toContain("Implement the parser for the new wire format.");
+
+    // If the original tab is gone, switching from B to a fresh C keeps the earlier handoff as origin.
+    t.agents.delete("root");
+    await t.switchTo(b.agentId, "c");
+    const fallbackHandoff = t.sent.at(-1)!.text;
+    expect(fallbackHandoff).toContain("Implement the parser for the new wire format.");
+    expect(fallbackHandoff).toContain("Skip benchmarks; only unit tests.");
+  });
+
+  it("reads legacy agent_message envelopes without provenance and scheduled heartbeat prompts", async () => {
+    const t = await setup();
+    t.timelines.set("root", []);
+    t.agents.get("root")!.lastUserMessageAt = null;
+    t.add("root", agentMessage("Audit the migration scripts.", { legacy: true }));
+    t.add("root", { type: "assistant_message", text: "Checked 3 of 5 scripts." });
+    await t.switchTo("root", "b");
+    expect(t.sent.at(-1)!.text).toContain("<user-updates>\nAudit the migration scripts.\n</user-updates>");
+
+    t.addAgent("scheduled", { lastUserMessageAt: null, title: "Nightly check" });
+    await t.store.update((draft) => {
+      draft.bindings.scheduled = { accountId: "a", source: "thread", at: "now" };
+      draft.sessions.scheduled = { accountId: "a", family: "codex", openedAt: "now" };
+    });
+    t.add("scheduled", heartbeat("Run the nightly regression check and open a summary."));
+    t.add("scheduled", { type: "assistant_message", text: "Suite started." });
+    await t.switchTo("scheduled", "b");
+    expect(t.sent.at(-1)!.text).toContain("<user-updates>\nRun the nightly regression check and open a summary.\n</user-updates>");
+  });
+
+  it("keeps child finish notifications in progress updates, and still refuses a fresh switch with no task instructions", async () => {
+    const t = await setup();
+    t.timelines.set("root", []);
+    t.agents.get("root")!.lastUserMessageAt = null;
+    t.add("root", agentMessage("   "));
+    t.add(
+      "root",
+      agentMessage("Agent sub-1 (Parser) finished.\n\n<agent-response>\nAll 14 parser tests pass.\n</agent-response>", {
+        event: "finished",
+        id: "sub-1",
+        title: "Parser",
+      }),
+    );
+    await expect(t.switchTo("root", "b")).rejects.toThrow(/Couldn't read the task's instructions/);
+
+    t.add("root", { type: "user_message", text: "Coordinate the parser and CLI changes." });
+    await t.switchTo("root", "b");
+    const handoff = t.sent.at(-1)!.text;
+    expect(handoff).toContain("<user-updates>\nCoordinate the parser and CLI changes.\n</user-updates>");
+    expect(handoff).toContain("[agent_message: finished from Parser (sub-1)]\nAgent sub-1 (Parser) finished.");
+    expect(handoff).toContain("All 14 parser tests pass.");
+  });
 });
 
 describe("fitting pending instructions", () => {
@@ -990,5 +1176,17 @@ describe("fitting pending instructions", () => {
     expect(text).toContain("[… 1 earlier instruction omitted to fit this update …]");
     expect(text).not.toContain("middle");
     expect(text).toMatch(/TAIL$/);
+  });
+});
+
+describe("reading a source's updates", () => {
+  it("refuses older history it can't page instead of treating the scan as complete", async () => {
+    // Older rows exist past the watermark, but the page gives no cursor to reach them.
+    const page = {
+      epoch: "e1", window: { maxSeq: 900 }, hasOlder: true, startCursor: null, gap: false, staleCursor: false,
+      entries: [{ item: { type: "user_message", text: "STOP" }, seqStart: 400, seqEnd: 900 }],
+    };
+    const paseo = { agents: { ref: () => ({ timeline: { refetch: async () => page } }) } } as unknown as PaseoApi;
+    await expect(readUpdates(paseo, "source", { epoch: "e1", seq: 5 })).rejects.toThrow(/complete handoff history/);
   });
 });

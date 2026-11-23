@@ -1,7 +1,16 @@
 # zerosub (Tom's fork)
 
-This is `tomgrin10/zerosub`, a fork of `kapybara-org/zerosub` tuned for Tom's setup: two Claude accounts, about 140
-agents, one VM. Upstream mergeability is optional; Tom's setup wins where they differ.
+This is `tomgrin10/zerosub`, a fork of `kapybara-org/zerosub` for Tom's setup. It is meant to go away: policy lives
+in Smart Session, and small general changes go upstream (Tom's decision, 2026-11-19). Until upstream releases the two
+PRs Smart Session needs, the fork is the latest upstream release plus the smallest set of commits on top:
+
+- upstream PR #107 (a pin with `allowLimited: true` keeps an agent on a limited account) and #108
+  (`zerosub.agents.move_before_limit`, with `stopBackgroundWork`), cherry-picked from their upstream branches;
+- loading a registry the old `1.5.1-pace` fork wrote (binding `source: "pace"` reads as `balance`);
+- this file, `CLAUDE.md` and `scripts/install-vm.sh`.
+
+Versions are `<upstream version>-pace.N`. To move to a newer upstream release, rebuild the same stack on its tag and
+drop whatever upstream now covers; once #107 and #108 are released, switch the VM back to the registry build.
 
 ## Releases
 
@@ -25,7 +34,8 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
 ## Working rules
 
 - Small PRs into `main`, one change each; each one becomes the next `-pace.N` build.
-- `npm run typecheck`, `npm test` and `npm run audit:mobile` pass before a PR.
+- `npm run typecheck`, `npm test` and `npm run audit:mobile` pass before a PR (CI runs them once the verify workflow
+  is on `main`).
 - Never wake dormant agents: nothing may reload a closed or archived agent, and moves happen one agent at a time
   (no bulk `reconcile` for a background feature).
 - Never touch the live daemon, `~/.paseo/zerosub` or live credentials from tests or harnesses; use an isolated
@@ -33,27 +43,22 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
 
 ## Invariants
 
-- **A move toward an agent's binding is never lost.** The saved binding, not memory, decides where a live portable
-  agent belongs. A move that waits (busy turn, background jobs, a held process) is kept in memory only as a hint;
-  upkeep (`moveDrifted`, every minute) finds any live agent whose session runs elsewhere than its own binding,
-  where routing would put it now, and moves it once it's between turns. Guards: never a closed or archived agent,
-  never one with background jobs or a stopped process, never a one-shot helper or a Codex thread, at most one such
-  move per agent in 10 minutes; a limited, signed-out or disabled bound account is left to the limit paths.
-  Tests: "a waiting move survives a plugin reload" in `server/failover.test.ts`.
+- **A registry an older fork build wrote loads whole.** Every binding, account, session and preference survives the
+  switch; a value only the fork knew is mapped to its upstream equivalent, never dropped (`StoredBindingSchema` in
+  `server/state.ts`). Tests: "a registry the 1.5.1-pace fork wrote" in `server/state.test.ts`.
 - **Session Guard never holds a session at its threshold while ZeroSub could move it.** The guard pauses at its own
   threshold (below 100%), where ZeroSub doesn't see a limit yet, so it asks: `zerosub.agents.move_before_limit` moves
-  that one agent, between turns, to the account the guard names (binding `auto`, timeline reason `near_limit`).
-  ZeroSub's guards apply: automatic switching on, a usable target, a portable open agent that isn't a one-shot
-  helper, the bounce guard, and `reopenAgent` (never wakes a closed agent; waits for a turn, background jobs or a
-  stopped process, and answers `waiting` with `waitingFor` and the jobs it waits for). Never a session the user
-  pinned (`source: user`). Asking again for a move that already waits isn't counted against the bounce guard.
-  Tests: "a move Session Guard asks for before the limit".
+  that one agent, between turns, to the account the guard names (binding `auto`). ZeroSub's guards apply: automatic
+  switching on, a usable subscription target, an open agent whose conversation can move, the bounce guard, and the
+  reopen guards (never wakes a closed agent; waits for a turn or background jobs, and answers `waiting` with
+  `waitingFor` and the jobs it waits for). Never a session the user pinned (`source: user`). Tests: "a move asked
+  for before the limit" in `server/failover.test.ts`.
 - **A move stops background work only when its caller asked for exactly that.** `move_before_limit` with
-  `stopBackgroundWork: true` stops the jobs Paseo can stop (`backgroundWork.stop`, Paseo 0.17+), reopens, and returns
-  every job the move ended in `stopped` (kind, description, command), so the caller can tell the agent what to start
-  again. No other path stops jobs. Work the daemon owns (ids `daemon:…`: heartbeats, change-request watches) outlives
-  a reopen, so it never holds a move back (`workAReopenEnds`); on a Paseo that can't list work, the snapshot's count
-  and the shell scan decide as before.
+  `stopBackgroundWork: true` stops the jobs Paseo can stop, reopens, and returns every job the move ended in
+  `stopped`, so the caller can tell the agent what to start again. No other path stops jobs. Work the daemon owns
+  (heartbeats, change-request watches) outlives a reopen, so it never holds a move back.
+- A move that waited and was lost to a plugin reload is finished by upstream's alignment check (every 30 s), which
+  replaced the fork's `moveDrifted`.
 
 ## Installing a build on the VM (for the orchestrator)
 

@@ -2,8 +2,9 @@ import type { PluginRpcContract } from "@getpaseo/plugin";
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import type { ZodType, input as ZodInput, output as ZodOutput } from "zod";
 import { useSyncExternalStore } from "react";
+import { moveProblem } from "../shared/format";
 import type { StateView } from "../shared/model";
-import { getState } from "../shared/rpc";
+import { getState, setAgentAccount } from "../shared/rpc";
 
 const IDLE_POLL_MS = 20_000;
 /** While the Accounts screen is open, so usage moves as agents use it. */
@@ -33,8 +34,8 @@ export interface ZeroSubStore {
   getSnapshot(): StoreSnapshot;
   watch(intervalMs: number): () => void;
   watchClosely(): () => void;
-  /** `refreshUsage` reads every account's usage first. */
-  refresh(options?: { refreshUsage?: boolean; fresh?: boolean }): Promise<void>;
+  /** `refreshUsage` reads usage first: only `accountId`'s, or every account's. */
+  refresh(options?: { refreshUsage?: boolean; fresh?: boolean; accountId?: string }): Promise<void>;
 }
 
 /**
@@ -48,10 +49,11 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
   /** The plain state query under way; polls and the refresh after an action share it. */
   let inFlight: Promise<void> | null = null;
   /**
-   * An explicit usage refresh under way. The daemon can take a while over one (it may renew sign-ins),
-   * so it runs beside the plain queries instead of holding them (and every action waiting on one) up.
+   * Explicit usage refreshes under way, by account ("" for every account). The daemon takes up to
+   * ~15 s over one, so they run beside the plain queries instead of holding them (and every action
+   * waiting on one) up.
    */
-  let usageInFlight: Promise<void> | null = null;
+  const usageInFlight = new Map<string, Promise<void>>();
   let issued = 0;
   let published = 0;
   let stopped = false;
@@ -107,8 +109,8 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
     return watch(ACTIVE_POLL_MS);
   }
 
-  function refresh(options: { refreshUsage?: boolean; fresh?: boolean } = {}): Promise<void> {
-    if (options.refreshUsage) return refreshUsage();
+  function refresh(options: { refreshUsage?: boolean; fresh?: boolean; accountId?: string } = {}): Promise<void> {
+    if (options.refreshUsage) return refreshUsage(options.accountId);
     if (inFlight) {
       if (!options.fresh) return inFlight;
       return inFlight.then(() => refresh());
@@ -121,27 +123,29 @@ export function createZeroSubStore(client: PluginClientContext): ZeroSubStore {
     return run;
   }
 
-  /** Asks the daemon to read every account's usage now, then shows the result. */
-  function refreshUsage(): Promise<void> {
-    if (usageInFlight) return usageInFlight;
-    const run = query(true).then((shown) => {
+  /** Asks the daemon to read usage now, `accountId`'s or every account's, then shows the result. */
+  function refreshUsage(accountId?: string): Promise<void> {
+    const key = accountId ?? "";
+    const pending = usageInFlight.get(key);
+    if (pending) return pending;
+    const run = query(true, accountId).then((shown) => {
       // A poll that started while usage was being read answered first, maybe with older readings.
       // The daemon has the new ones now, so ask once more rather than leave them unshown.
       if (!shown) return refresh({ fresh: true });
       return undefined;
     });
-    usageInFlight = run;
+    usageInFlight.set(key, run);
     void run.finally(() => {
-      if (usageInFlight === run) usageInFlight = null;
+      if (usageInFlight.get(key) === run) usageInFlight.delete(key);
     });
     return run;
   }
 
   /** One state query. Resolves to whether its answer was shown: an older, slower answer never replaces a newer one. */
-  function query(withUsage: boolean): Promise<boolean> {
+  function query(withUsage: boolean, accountId?: string): Promise<boolean> {
     const sequence = ++issued;
     return client
-      .rpc(getState, { refreshUsage: withUsage ? true : undefined })
+      .rpc(getState, { refreshUsage: withUsage ? true : undefined, accountId })
       .then((state) => {
         if (sequence < published) return false;
         published = sequence;
@@ -265,6 +269,28 @@ function describeIssue(issue: Issue): string {
     if (issue.code === "too_small" && issue.minimum !== undefined) return `${field} needs at least ${issue.minimum} characters.`;
   }
   return field ? `${field}: ${issue.message}` : issue.message;
+}
+
+/**
+ * Paseo stopped waiting for the daemon's answer. The plugin doesn't stop with it, so what was asked
+ * for may still be under way, or done: say that rather than that it failed.
+ */
+export function stoppedWaiting(error: unknown): boolean {
+  return /Plugin RPC timed out|Timeout waiting for message/i.test(describe(error));
+}
+
+/**
+ * Moves an agent to an account (`null`: back to following the default), for its account button
+ * and its Account control. Throws what Paseo should show: that the agent couldn't be reloaded, say.
+ */
+export async function moveAgent(store: ZeroSubStore, agentId: string, accountId: string | null, to: string): Promise<void> {
+  const summary = await store.rpc(setAgentAccount, { agentId, accountId }).catch((error: unknown) => {
+    // The move goes on without Paseo waiting for it, and the account shows it under way.
+    if (stoppedWaiting(error)) return null;
+    throw error;
+  });
+  const problem = summary && moveProblem(summary, to);
+  if (problem) throw new Error(problem);
 }
 
 export function useStore(store: ZeroSubStore): StoreSnapshot {

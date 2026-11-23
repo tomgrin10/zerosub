@@ -1,4 +1,5 @@
-import type { AccountView, Credits, UsageWindow } from "./model";
+import { estimateApiCost, onAnthropicApi, totalTokens, type AccountView, type PaceView, WEEK_NEARLY_USED_PERCENT, type AgentRoute, type AzureSummary, type Credits, type Egress, type ExtraUsage, type UsageWindow } from "./model";
+import type { ReopenSummary } from "./rpc";
 
 /** "in 2h 14m", "in 3d 4h", "now". */
 export function formatResetIn(resetsAt: string | null, now: number = Date.now()): string | null {
@@ -18,6 +19,51 @@ export function formatResetIn(resetsAt: string | null, now: number = Date.now())
   return restHours === 0 ? `in ${days}d` : `in ${days}d ${restHours}h`;
 }
 
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/**
+ * When a window resets, in local time: "18:00" today, "Fri 09:00" within the week, "Nov 4 09:00"
+ * a week on. Null once it has passed.
+ */
+export function formatResetAt(resetsAt: string | null, now: number = Date.now()): string | null {
+  if (!resetsAt) return null;
+  const at = Date.parse(resetsAt);
+  if (!Number.isFinite(at) || at <= now) return null;
+  const when = new Date(Math.round(at / 60_000) * 60_000);
+  const time = `${String(when.getHours()).padStart(2, "0")}:${String(when.getMinutes()).padStart(2, "0")}`;
+  const today = new Date(now);
+  const days = Math.round(
+    (new Date(when.getFullYear(), when.getMonth(), when.getDate()).getTime() -
+      new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime()) /
+      86_400_000,
+  );
+  if (days <= 0) return time;
+  if (days < 7) return `${WEEKDAYS[when.getDay()]} ${time}`;
+  return `${MONTHS[when.getMonth()]} ${when.getDate()} ${time}`;
+}
+
+/**
+ * How long until a window resets, as Claude Code's status line counts it: "3h26m", "17h26m", then
+ * days and hours from a day on, "1d17h", and minutes in the last hour, "26m". Null once it has passed.
+ */
+export function formatCountdown(resetsAt: string | null, now: number = Date.now()): string | null {
+  if (!resetsAt) return null;
+  const at = Date.parse(resetsAt);
+  if (!Number.isFinite(at) || at <= now) return null;
+  const minutes = Math.floor((at - now) / 60_000);
+  const hours = Math.floor(minutes / 60);
+  if (hours >= 24) return `${Math.floor(hours / 24)}d${hours % 24}h`;
+  return hours > 0 ? `${hours}h${minutes % 60}m` : `${minutes}m`;
+}
+
+/** "5h", "7d": a window's name the way a status line writes it (see `windowLabel` in server/codex.ts). */
+export function shortWindowLabel(label: string): string {
+  if (label === "Weekly") return "7d";
+  const span = /^(\d+)-(hour|day|minute)$/.exec(label);
+  return span ? `${span[1]}${span[2]![0]}` : label;
+}
+
 export function formatPercent(value: number): string {
   return `${Math.round(Math.min(100, Math.max(0, value)))}%`;
 }
@@ -32,6 +78,30 @@ export function formatCredits(credits: Credits): string {
   return `${whole} ChatGPT credit${whole === "1" ? "" : "s"} left`;
 }
 
+const CURRENCY_SIGNS: Record<string, string> = { USD: "$", EUR: "€", GBP: "£" };
+
+/** An amount in minor units of `currency` (cents for USD): "$12.34", "1,234.50 CAD". */
+function formatMoney(minor: number, currency: string | null): string {
+  const [whole, cents] = (Math.max(0, minor) / 100).toFixed(2).split(".") as [string, string];
+  const amount = `${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${cents}`;
+  const sign = currency ? CURRENCY_SIGNS[currency.toUpperCase()] : undefined;
+  if (sign) return `${sign}${amount}`;
+  return currency ? `${amount} ${currency.toUpperCase()}` : amount;
+}
+
+/**
+ * "Extra usage on · $12.34 of $50.00 this month", "Extra usage on · $12.34 spent this month", or
+ * "Extra usage on" when the spend isn't known. `null` when it's off: nothing to show then.
+ */
+export function formatExtraUsage(extra: ExtraUsage): string | null {
+  if (!extra.enabled) return null;
+  if (extra.spend === null) return "Extra usage on";
+  const spent = formatMoney(extra.spend, extra.currency);
+  return extra.limit === null
+    ? `Extra usage on · ${spent} spent this month`
+    : `Extra usage on · ${spent} of ${formatMoney(extra.limit, extra.currency)} this month`;
+}
+
 /** Claude's 5-hour and weekly windows, and Codex's two (see `parseUsage`, `parseRateLimits`). */
 const ACCOUNT_WINDOWS = new Set(["five_hour", "seven_day", "primary", "secondary"]);
 
@@ -42,6 +112,15 @@ const ACCOUNT_WINDOWS = new Set(["five_hour", "seven_day", "primary", "secondary
  */
 export function capsAccount(window: UsageWindow): boolean {
   return ACCOUNT_WINDOWS.has(window.id);
+}
+
+/**
+ * The model or surface a narrower window belongs to, lowercase: "fable" for "Weekly · Fable", else
+ * the window's id. It names the key of an account's `modelLimits`.
+ */
+export function windowScope(window: UsageWindow): string {
+  const named = window.label.match(/^Weekly\s*·\s*(.+)$/i)?.[1]?.trim();
+  return (named || window.id).toLowerCase();
 }
 
 /** The busiest window that caps the whole account: how much room it has left for any model. */
@@ -90,6 +169,60 @@ export function shortLabel(account: Pick<AccountView, "label">, max = 18): strin
   return label.length <= max ? label : `${label.slice(0, max - 1)}…`;
 }
 
+const MOVES_WHEN: Record<NonNullable<AgentRoute["waiting"]>, string> = {
+  idle: "once it's idle",
+  turn: "when its current turn ends",
+  background: "once the background work it left running stops",
+  restart: "when its session next starts",
+};
+
+/**
+ * A composer pill's label and tooltip for an agent routed to `account`. While its session still
+ * runs on another account, both are named, so the pill never claims an account the agent isn't
+ * using yet, and the tooltip says when the move happens.
+ */
+export function pillText(
+  account: Pick<AccountView, "label" | "email">,
+  running: Pick<AccountView, "label"> | null,
+  waiting: AgentRoute["waiting"],
+): { label: string; title: string } {
+  const named = `${account.label}${account.email && account.email !== account.label ? ` (${account.email})` : ""}`;
+  if (!running) return { label: shortLabel(account), title: `Account: ${named}` };
+  return {
+    label: `${shortLabel(running, 12)} → ${shortLabel(account, 12)}`,
+    title: `Account: ${running.label}, moving to ${named} ${MOVES_WHEN[waiting ?? "idle"]}`,
+  };
+}
+
+/** What moving agents came to, after `prefix`: "work is now the default · 2 agent(s) switched · …". */
+export function describeReopen(prefix: string, summary: ReopenSummary): string {
+  const parts = [prefix];
+  if (summary.continuedIn) parts.push(`continuing in “${summary.continuedIn.title}”`);
+  if (summary.reopened.length > 0) parts.push(`${summary.reopened.length} agent(s) switched`);
+  if (summary.pending.length > 0) parts.push(`${summary.pending.length} still switching (their timelines will say when)`);
+  if (summary.deferred.length > 0) parts.push(`${summary.deferred.length} will switch after their current turn`);
+  if (summary.failed.length > 0) parts.push(`${summary.failed.length} couldn't be reloaded and will switch when their session next starts`);
+  return parts.join(" · ");
+}
+
+/** Why moving one agent to `to` didn't happen now, for its account button and `/account`; null when it did or will by itself. */
+export function moveProblem(summary: ReopenSummary, to: string): string | null {
+  const failed = summary.failed[0];
+  if (!failed) return null;
+  return `Couldn't reload this agent onto ${to} (${failed.error.replace(/\.$/, "")}), so it moves when its session next starts.`;
+}
+
+/** Why an agent can't be moved onto an account at its limit while automatic switching is on. */
+export function limitedPick(label: string): string {
+  return `${label} is at its limit, and with automatic switching on the agent would move straight off it again. Pick another account, or mark ${label} as available again on its card in Accounts if it has room.`;
+}
+
+/** Why an agent can't be moved onto an account whose limit for its model is reached, while others can run there. */
+export function limitedModelPick(label: string, scope: string): string {
+  const name = scope.charAt(0).toUpperCase() + scope.slice(1);
+  return `${label} has reached its ${name} limit, so this agent's model can't run there now. Pick another account or another model.`;
+}
+
 /** One line summarising an account's headroom, e.g. "42% of 5-hour used · resets in 2h". */
 /**
  * The line under an account's name: its email, plus its organization when that adds something.
@@ -113,6 +246,18 @@ export function formatAge(at: string, now: number = Date.now()): string {
   return hours < 48 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
 }
 
+/** How old an address may get before it says so: checks run every half hour. */
+const EGRESS_FRESH_MS = 60 * 60_000;
+
+/** "IP: 203.0.113.7 (US)", with its age once that's an hour; null before the first check. */
+export function egressText(egress: Egress | null, now: number = Date.now()): string | null {
+  if (!egress) return null;
+  if (!egress.ip) return egress.error ? "IP: couldn't check" : null;
+  const old = egress.checkedAt && now - Date.parse(egress.checkedAt) >= EGRESS_FRESH_MS ? formatAge(egress.checkedAt, now) : null;
+  const notes = [egress.country, old].filter(Boolean).join(", ");
+  return `IP: ${egress.ip}${notes ? ` (${notes})` : ""}`;
+}
+
 export function usageSummary(account: AccountView, now: number = Date.now()): string | null {
   if (account.status === "disabled") return "Disabled for now";
   if (account.status === "limited") {
@@ -126,9 +271,85 @@ export function usageSummary(account: AccountView, now: number = Date.now()): st
   return reset ? `${base} · resets ${reset}` : base;
 }
 
+/** Set aside by the user, whatever else `status` says. Older servers only said so through `status`. */
+export function isDisabled(account: Pick<AccountView, "status" | "disabled">): boolean {
+  return account.disabled || account.status === "disabled";
+}
+
+/**
+ * The provider reports usage windows (5-hour, weekly) for this account: a Claude or ChatGPT
+ * subscription account's. Not an API account, billed per use, nor a Grok or Cursor account, whose
+ * providers never send windows, nor any Pi account, whose CLI reports none.
+ */
+export function reportsUsage(account: Pick<AccountView, "auth" | "family">): boolean {
+  return account.auth !== "api" && (account.family === "claude" || account.family === "codex");
+}
+
+/**
+ * ZeroSub may carry work on with this account by itself: it's ready, and not billed per use, or with
+ * paid API fallback on a paid stand-in (`paidStandIn`); not a Pi account (Pi's own login may be an
+ * API key too). The app's side of `canStandIn` and `isPaidStandIn` in server/routing.ts, which pick
+ * where forks and switches go: any other API key is used only when picked.
+ */
+export function canStandIn(account: Pick<AccountView, "status" | "auth" | "family" | "azure" | "bedrock" | "api">, paidFallback = false): boolean {
+  return account.status === "ready" && account.family !== "pi" && (account.auth !== "api" || (paidFallback && paidStandIn(account)));
+}
+
+/**
+ * One "Use paid API accounts when every subscription is out" lets stand in, as the server's
+ * `isPaidStandIn` with it on: an Azure OpenAI or AWS Bedrock account, or a Claude account on an API
+ * key or token that goes to Anthropic's own API. A Claude key whose settings couldn't be read counts
+ * as going elsewhere.
+ */
+export function paidStandIn(account: Pick<AccountView, "family" | "auth" | "azure" | "bedrock" | "api">): boolean {
+  if (account.azure || account.bedrock) return true;
+  return account.family === "claude" && account.auth === "api" && account.api !== null && onAnthropicApi(account.api.baseUrl);
+}
+
 /** The note over state the daemon stopped answering for: "Showing data from 3m ago · couldn't refresh: …". */
 export function staleNotice(updatedAt: number | null, error: string, now: number = Date.now()): string {
   if (updatedAt === null) return `Couldn't refresh: ${error}`;
   const age = formatAge(new Date(updatedAt).toISOString(), now);
   return `Showing data from ${age === "just now" ? "a moment ago" : age} · couldn't refresh: ${error}`;
+}
+
+/** "1,234", "56.7K", "8.90M" tokens. */
+export function formatTokens(count: number): string {
+  if (count < 10_000) return Math.round(count).toLocaleString("en-US");
+  if (count < 1_000_000) return `${(count / 1_000).toFixed(count < 100_000 ? 1 : 0)}K`;
+  return `${(count / 1_000_000).toFixed(count < 100_000_000 ? 2 : 0)}M`;
+}
+
+/**
+ * A paid API account's month, as its card shows it: its tokens, and the cost estimated from its price
+ * table ("cost unknown" while no model that used tokens has a price).
+ */
+export function apiUsageLines(account: Pick<AzureSummary, "prices" | "usage">, now: number = Date.now()): { tokens: string; cost: string; note: string | null } {
+  const month = account.usage;
+  const name = new Date(now).toLocaleString("en-US", { month: "long", timeZone: "UTC" });
+  const total = totalTokens(month);
+  const cache = total.cacheWrite > 0 ? `${formatTokens(total.cachedInput)} cache read, ${formatTokens(total.cacheWrite)} cache write` : `${formatTokens(total.cachedInput)} cached`;
+  const tokens = `${name}: ${formatTokens(total.input)} input (${cache}) · ${formatTokens(total.output)} output tokens`;
+  const { usd, complete } = estimateApiCost(month, account.prices);
+  const cost =
+    usd === null
+      ? total.input + total.output > 0
+        ? "Cost unknown: add prices for its models in the account's settings"
+        : "No tokens used yet this month"
+      : `≈ $${usd.toFixed(usd < 10 ? 2 : 0)} this month${complete ? "" : " (some models have no price yet)"}`;
+  const uncounted = month?.uncounted ?? 0;
+  const note = uncounted > 0 ? `${uncounted} turn${uncounted === 1 ? "" : "s"} couldn't be counted (no session file found), so these totals are short.` : null;
+  return { tokens, cost, note };
+}
+
+/** What pacing makes of an account, in a few words for a menu row. `next`: pacing picks it for the next new agent. */
+export function paceVerdict(pace: PaceView, next: boolean): string {
+  if (next) return "Picks next";
+  if (pace.gated) return "Held back: busy hour";
+  if (pace.weeklyUsed !== null && pace.weeklyUsed >= WEEK_NEARLY_USED_PERCENT) return "Week nearly used";
+  // The same standing as the account card's `describePace`.
+  if (pace.weeklyUsed !== null && pace.weekElapsed !== null && Math.round(pace.weeklyUsed + pace.pendingWeekly) > Math.round(pace.weekElapsed)) {
+    return "Using week fast";
+  }
+  return "Room to spare";
 }

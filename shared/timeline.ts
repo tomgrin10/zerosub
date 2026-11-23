@@ -25,11 +25,11 @@ export const SwitchRowSchema = z.object({
     "enabled",
     /** Every account of this provider is at its limit; nothing to switch to. */
     "exhausted",
-    /** Moved to the account whose weekly quota is most at risk of resetting unused. */
-    "pace",
-    /** Pacing was turned off, and this agent follows the default again. */
-    "pace_off",
-    /** `from` is nearly at its limit, and Session Guard asked to move the agent before it got there. */
+    /** `from` is a paid API account (AWS Bedrock) it moved onto by itself, and a subscription account has room again. */
+    "room",
+    /** `from` still works but is projected past the 5-hour pacing gate; a cold idle agent moved off it. */
+    "pacing",
+    /** `from` is nearly at its limit, and another plugin asked to move the agent before it gets there. */
     "near_limit",
   ]),
   /** When the exhausted account frees up again, if known. */
@@ -40,12 +40,21 @@ export const SwitchRowSchema = z.object({
   continuedIn: z.object({ agentId: z.string(), title: z.string() }).nullable().default(null),
   /** Set when `continuedIn` runs on the other provider (a fork from Claude to ChatGPT, or back). */
   toFamily: FamilySchema.nullable().default(null),
+  /** Set when the fork went to a provider outside the account families, e.g. OpenCode. It has no account. */
+  toProvider: z.string().nullable().default(null),
   /**
    * `switched`: the agent now runs on `to`. `pending`: it moves when its session next starts.
    * `continued`: the work goes on in `continuedIn`. `stayed`: it remains on `from` (see `detail`).
    * `reset`: a banked reset refilled `from`, and the agent stayed on it.
    */
   outcome: z.enum(["switched", "pending", "continued", "stayed", "reset"]).default("switched"),
+  /** Delivery state for a fork row. Undefined retains the pre-delivery-status rendering. */
+  delivery: z.enum(["sent", "up-to-date", "found", "uncertain"]).optional(),
+  /**
+   * The agent reloaded on `to` and kept this conversation. Absent on older rows, and on a new-tab
+   * handoff, so a client that does not know the field still parses the row.
+   */
+  sameConversation: z.boolean().optional(),
   detail: z.string().nullable().default(null),
   at: z.string(),
 });

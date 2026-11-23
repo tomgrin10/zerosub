@@ -24,17 +24,6 @@ export const preferences = defineSettings({
     moveAgentsOnDefaultChange: z.boolean().default(true),
     /** New agents choose an account by usage instead of the default. */
     balanceNewAgents: z.boolean().default(false),
-    /**
-     * Steer Claude work to the account whose weekly quota is most at risk of resetting unused: new
-     * agents go there, and recently active idle agents move there one at a time. Pins stay put.
-     */
-    paceWeeklyUsage: z.boolean().default(true),
-    /**
-     * Paseo sometimes leaves an agent with an extra provider process that nothing tracks any more
-     * (getpaseo/paseo#9408). Stop one that isn't the agent's newest and is on another account, or has
-     * been idle for 10 minutes; never while the agent is mid-turn.
-     */
-    reapDetachedDuplicates: z.boolean().default(true),
     /** When every account of a provider is at its limit, spend a banked reset instead of stopping. */
     autoRedeem: z.boolean().default(false),
     /**
@@ -44,11 +33,40 @@ export const preferences = defineSettings({
     useCredits: z.boolean().default(false),
     /**
      * When every account of a provider is at its limit, carry the chat on in a new agent on the
-     * other provider (Claude ↔ ChatGPT), in a mode no more permissive than the original's.
+     * other provider (Claude ↔ ChatGPT) or, for Claude, on OpenCode. ChatGPT gets a mode no looser than the original's; OpenCode runs the host's policy.
      */
     forkOtherProvider: z.boolean().default(false),
+    /** Where a stopped Claude chat continues when the fork option is on. */
+    claudeForkDestination: z.enum(["codex", "opencode"]).default("codex"),
+    /** OpenCode model for that fork, from this host's catalog. Empty uses the host's default. */
+    forkOpenCodeModel: z.string().default(""),
+    /** Thinking option that model offers, from this host's catalog. Empty uses the model's default. */
+    forkOpenCodeThinking: z.string().default(""),
+    /**
+     * Off unless turned on. Two ChatGPT accounts in one workspace may keep a Codex conversation:
+     * a limit reloads that agent on the other account. Every other case, including a workspace
+     * that is out of credits, still opens a new tab. A failed resume puts the agent back and
+     * opens that tab.
+     */
+    codexSameConversation: z.boolean().default(false),
+    /**
+     * Off unless turned on. When every subscription account of a provider is out (at its limit,
+     * signed out or disabled), routing may move agents onto a paid API account that stands in for
+     * one (an Azure OpenAI account under ChatGPT; an AWS Bedrock account, or an API key or token
+     * on Anthropic's own API, under Claude), billed per use; a banked reset goes first when
+     * `autoRedeem` is on. Off, such an account is only used when picked for an agent or made the
+     * default, and so is a key for another endpoint either way. Pi accounts never stand in.
+     */
+    paidApiFallback: z.boolean().default(false),
     /** Show the account pill in the composer of Claude and Codex agents. */
     showComposerPill: z.boolean().default(true),
+    /**
+     * On unless turned off. Where the composer has the Account control (Paseo 0.16 and
+     * later), show the account pill on a running agent while the control isn't on screen: Paseo hides
+     * it in a composer too narrow for it. Off, the pill steps back for the control as it did before,
+     * on screen or not.
+     */
+    keepComposerPill: z.boolean().default(true),
   }),
 });
 

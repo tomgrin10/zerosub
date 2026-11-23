@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFile, rm } from "node:fs/promises";
+import { lstat, readFile, rm, stat } from "node:fs/promises";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
-import type { ExtraUsage, LoginMethod, Usage, UsageWindow } from "../shared/model";
+import type { ApiSummary, ExtraUsage, LoginMethod, Usage, UsageWindow } from "../shared/model";
 import {
   ProgressEmitter,
   spawnEnv,
@@ -11,15 +11,33 @@ import {
   type FamilyAdapter,
   type Identity,
   type LoginHandle,
+  type ProxyState,
   type RedeemReply,
   type UsageRead,
 } from "./adapter";
+import { bedrockEnv, bedrockIdentity, isBedrockHome, readBedrockAccount } from "./bedrock";
 import { browserCaptureScript, providerCommand } from "./binaries";
 import { CLAUDE_RESET_PROGRAM, describeResetBlock, parseClaudeResets, readClaimReply } from "./claude-resets";
-import { prepareClaudeHome } from "./homes";
+import {
+  claudeClearTextProxy,
+  claudeHomeHoldsAccount,
+  claudeSessionsShared,
+  prepareClaudeHome,
+  readAccountApi,
+  readAccountProxy,
+  shareClaudeSessions,
+  writeAccountApi,
+  writeAccountProxy,
+  type ApiConfig,
+} from "./homes";
+import { readJson } from "./json-file";
 import { detectClaudeLimit, detectClaudeSignOut } from "./limits";
+import { inheritedClaudeProxy, mainProxyBlock, mainProxyEnv, mainSettingsEnv, readMainProxy, writeMainProxy } from "./main-proxy";
 import { mainClaudeGlobalConfig } from "./paths";
 import { firstUrl, run, stripAnsi } from "./process";
+import { eachProcessEnvironment, homesInEnvironment as inEnvironment, parseTrace } from "./processes";
+import { providerEnv } from "./provider-env";
+import { bypassesProxy, noProxyFromEnv, proxiedFetch, proxyFromEnv } from "./proxy";
 import { retryDelayMs } from "./usage";
 
 const API = "https://api.anthropic.com";
@@ -35,6 +53,12 @@ function apiHeaders(token: string): Record<string, string> {
     Accept: "application/json",
     "Content-Type": "application/json",
   };
+}
+
+function planFromTier(tier: string | null | undefined): string | null {
+  if (tier === "default_claude_max_5x") return "max";
+  if (tier === "default_claude_max_20x") return "ultra";
+  return null;
 }
 
 function isFresh(credentials: Credentials | null): credentials is Credentials {
@@ -64,12 +88,22 @@ export class ClaudeAdapter implements FamilyAdapter {
   private readonly renewing = new Map<string, Promise<Credentials | null>>();
   private readonly resetNotes = new Map<string, string>();
 
+  constructor() {
+    // Off macOS and Linux, which processes run on a home can't be told (see `eachProcessEnvironment`),
+    // so `homesInUse` isn't offered: the service then keeps the accounts in `homes/`, without an error.
+    if (process.platform !== "darwin" && process.platform !== "linux") Object.defineProperty(this, "homesInUse", { value: undefined });
+  }
+
   async env(home: string | null): Promise<EnvPatch> {
-    if (!home) return { CLAUDE_CONFIG_DIR: null, CLAUDE_SECURESTORAGE_CONFIG_DIR: null };
+    // The CLI login's proxy set here, unless main's settings set one (see `mainProxyEnv`).
+    if (!home) return { CLAUDE_CONFIG_DIR: null, CLAUDE_SECURESTORAGE_CONFIG_DIR: null, ...(await mainProxyEnv()) };
     // Both point at the home so the keychain entry and refresh locks follow it even when the
     // daemon itself runs with CLAUDE_SECURESTORAGE_CONFIG_DIR set.
     const patch: EnvPatch = { CLAUDE_CONFIG_DIR: home, CLAUDE_SECURESTORAGE_CONFIG_DIR: home };
     for (const key of OVERRIDING_AUTH) if (process.env[key]) patch[key] = "";
+    // An AWS Bedrock account: Claude Code on Bedrock with its AWS credentials (see bedrock.ts). Throws
+    // when its settings can't be read, so the session isn't opened without them.
+    if (isBedrockHome(home)) Object.assign(patch, bedrockEnv(await readBedrockAccount(home)));
     return patch;
   }
 
@@ -80,14 +114,56 @@ export class ClaudeAdapter implements FamilyAdapter {
     return { ok: false, detail: (result.stderr || result.stdout).trim().split("\n")[0] || `${command} not found` };
   }
 
-  prepareHome(home: string): Promise<void> {
-    return prepareClaudeHome(home);
+  prepareHome(home: string, wanted?: () => Promise<boolean>): Promise<void> {
+    return prepareClaudeHome(home, false, wanted);
   }
 
-  async identity(home: string | null): Promise<Identity> {
+  sessionsShared(home: string): Promise<boolean> {
+    return claudeSessionsShared(home);
+  }
+
+  shareSessions(home: string, share: boolean, wanted?: () => Promise<boolean>): Promise<void> {
+    return shareClaudeSessions(home, share, wanted);
+  }
+
+  async proxyState(home: string | null): Promise<ProxyState> {
+    if (home) return { own: await readAccountProxy(home), file: null, inherited: await inheritedClaudeProxy(), blocked: null };
+    const { proxy, file } = await readMainProxy();
+    return { own: proxy, file, inherited: await inheritedClaudeProxy(true), blocked: await mainProxyBlock() };
+  }
+
+  setProxy(home: string | null, proxy: string | null, wanted?: () => Promise<boolean>): Promise<void> {
+    return home ? writeAccountProxy(home, proxy, wanted) : writeMainProxy(proxy);
+  }
+
+  egress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
+    // Bedrock's requests go to AWS, not Anthropic, so Anthropic's edge has nothing to say about them.
+    if (isBedrockHome(home)) return Promise.resolve(null);
+    return claudeEgress(home);
+  }
+
+  api(home: string | null): Promise<ApiSummary | null> {
+    return home ? readAccountApi(home) : Promise.resolve(null);
+  }
+
+  clearTextProxy(home: string, baseUrl: string | null, through?: string): Promise<string | null> {
+    return claudeClearTextProxy(home, baseUrl, through);
+  }
+
+  setApi(home: string | null, config: ApiConfig, wanted?: () => Promise<boolean>): Promise<void> {
+    if (!home) return Promise.reject(new Error("Your Claude CLI login's key isn't set here."));
+    return writeAccountApi(home, config, wanted);
+  }
+
+  async identity(home: string | null, options: { livePlan?: boolean } = {}): Promise<Identity> {
+    if (isBedrockHome(home)) {
+      // Nothing signs in: the credentials are checked when they're saved, and a refusal is learned from a turn.
+      const account = await readBedrockAccount(home);
+      return { signedIn: true, email: null, plan: "AWS Bedrock", organization: null, identity: bedrockIdentity(account) };
+    }
     const { command, prefix } = await providerCommand("claude");
     const result = await run(command, [...prefix, "auth", "status", "--json"], {
-      env: spawnEnv(await this.env(home)),
+      env: spawnEnv(await this.env(home), "claude"),
       timeoutMs: 30_000,
     });
     const status = parseJsonObject(result.stdout);
@@ -100,17 +176,52 @@ export class ClaudeAdapter implements FamilyAdapter {
     }
     const email = str(status.email);
     const orgId = str(status.orgId);
+    let plan = str(status.subscriptionType);
+    if (signedIn && (email || plan === "max")) {
+      const config = email ? await readFile(home ? join(home, ".claude.json") : mainClaudeGlobalConfig(), "utf8").catch(() => "") : "";
+      const profile = parseJsonObject(config)?.oauthAccount as Record<string, unknown> | undefined;
+      const matches = email && str(profile?.emailAddress)?.toLowerCase() === email.toLowerCase() &&
+        (!orgId || str(profile?.organizationUuid) === orgId);
+      const name = matches ? str(profile?.planDisplayName) : null;
+      const tier = matches ? str(profile?.organizationRateLimitTier) : null;
+      const livePlan = options.livePlan && email;
+      const credentials = livePlan || (!name && !tier && plan === "max")
+        ? await readCredentials(home).catch(() => null)
+        : null;
+      const live = livePlan ? await this.livePlan(home, credentials, livePlan, orgId).catch(() => null) : null;
+      // A live profile can reflect a plan change before either of Claude's local files updates.
+      plan = live ?? name ?? planFromTier(tier) ?? (!tier && plan === "max" ? planFromTier(credentials?.rateLimitTier) : null) ?? plan;
+    }
     return {
       signedIn,
       email,
-      plan: str(status.subscriptionType),
+      plan,
       organization: str(status.orgName),
       identity: email ? `${orgId ?? "personal"}|${email.toLowerCase()}` : null,
     };
   }
 
+  private async livePlan(home: string | null, credentials: Credentials | null, email: string, orgId: string | null): Promise<string | null> {
+    const token = isFresh(credentials) ? credentials.accessToken : null;
+    if (!token) return null;
+    const response = await apiFetch(home, `${API}/api/oauth/profile`, {
+      headers: apiHeaders(token), signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return null;
+    const profile = await response.json() as {
+      account?: { email?: unknown };
+      organization?: { uuid?: unknown; plan_display_name?: unknown; rate_limit_tier?: unknown };
+    } | null;
+    const organization = profile?.organization;
+    if (str(profile?.account?.email)?.toLowerCase() !== email.toLowerCase() ||
+      (orgId && str(organization?.uuid) !== orgId)) return null;
+    return str(organization?.plan_display_name) ?? planFromTier(str(organization?.rate_limit_tier));
+  }
+
   async usage(home: string | null, options: { renewLogin?: boolean } = {}): Promise<UsageRead> {
     const fetchedAt = new Date().toISOString();
+    // No plan windows: its tokens are counted per turn instead (see Service.countBedrockTurn).
+    if (isBedrockHome(home)) return { fetchedAt, windows: [], error: null, cached: false, resets: null, credits: null };
     let credentials = await readCredentials(home).catch(() => null);
     if (!isFresh(credentials) && options.renewLogin) credentials = await this.renewLogin(home);
     const profileScope = !credentials?.scopes || credentials.scopes.includes("user:profile");
@@ -118,19 +229,22 @@ export class ClaudeAdapter implements FamilyAdapter {
       try {
         // The `cedar_ember` read is the one Claude Code's /limit-reset makes: usage plus banked resets.
         // Spend (`extra_usage`) costs Anthropic another lookup, which `skip_spend` avoids; ask for it,
-        // and if that read fails on Anthropic's side, take the windows without it rather than none.
+        // and if it fails (except auth or rate limits), take the windows without it rather than none.
         const token = credentials.accessToken;
-        const read = (url: string) => fetch(url, { headers: apiHeaders(token), signal: AbortSignal.timeout(15_000) });
+        const read = (url: string) => apiFetch(home, url, { headers: apiHeaders(token), signal: AbortSignal.timeout(15_000) });
         let response = await read(USAGE_WITH_SPEND);
-        if (response.status >= 500) response = await read(USAGE_WITHOUT_SPEND);
+        const withSpend = response.ok || [401, 403, 429].includes(response.status);
+        if (!withSpend) response = await read(USAGE_WITHOUT_SPEND);
         if (response.ok) {
           const body = (await response.json()) as { cedar_ember?: unknown; extra_usage?: unknown };
           const windows = parseUsage(body);
           this.noteResetStatus(home, body.cedar_ember);
-          const extraUsage = parseExtraUsage(body.extra_usage);
+          const resetStatus = parseClaudeResets(body.cedar_ember);
           return {
-            fetchedAt, windows, error: null, cached: false, resets: parseClaudeResets(body.cedar_ember).offer, credits: null,
-            ...(extraUsage ? { extraUsage } : {}),
+            fetchedAt, windows, error: null, cached: false, resets: resetStatus.offer, credits: null,
+            checkResetsInClaude: resetStatus.checkInClaude ?? false,
+            fableResets: resetStatus.fableResets,
+            ...(withSpend ? { extraUsage: parseExtraUsage(body.extra_usage) } : {}),
           };
         }
         // Anthropic rate-limits this endpoint (Claude Code and Paseo read it too). Wait as long as it
@@ -175,7 +289,7 @@ export class ClaudeAdapter implements FamilyAdapter {
       pending = (async () => {
         const { command, prefix } = await providerCommand("claude");
         await run(command, [...prefix, "-p", "/usage", "--no-session-persistence", "--output-format", "json"], {
-          env: spawnEnv(await this.env(home)),
+          env: spawnEnv(await this.env(home), "claude"),
           cwd: tmpdir(),
           timeoutMs: 90_000,
         });
@@ -187,6 +301,7 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   async redeemReset(home: string | null, options: { onlyAtLimit?: boolean } = {}): Promise<RedeemReply> {
+    if (isBedrockHome(home)) return { outcome: "none", message: "AWS Bedrock accounts have no banked resets.", left: 0 };
     let credentials = await readCredentials(home).catch(() => null);
     if (!isFresh(credentials)) credentials = await this.renewLogin(home);
     const token = credentials?.accessToken;
@@ -197,7 +312,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     // Ask which grant is next: the server only accepts that one.
     let status: ReturnType<typeof parseClaudeResets>;
     try {
-      const response = await fetch(USAGE_WITHOUT_SPEND, {
+      const response = await apiFetch(home, USAGE_WITHOUT_SPEND, {
         headers: apiHeaders(token),
         signal: AbortSignal.timeout(15_000),
       });
@@ -206,10 +321,14 @@ export class ClaudeAdapter implements FamilyAdapter {
     } catch (error) {
       return { outcome: "error", message: `Couldn't check the account's resets: ${describe(error)}`, left: null };
     }
-    if (!status.offer || !status.nextGrantId) return { outcome: "none", message: "No banked resets left on this account.", left: 0 };
-    if (options.onlyAtLimit && !status.atLimit) {
+    if (status.offer && options.onlyAtLimit && !status.atLimit) {
       // Something refilled the account since the limit hit, e.g. another host sharing it spent a reset.
       return { outcome: "not_limited", message: "Claude says this account has room again, so the reset was kept.", left: status.offer.available };
+    }
+    if (!status.offer || !status.nextGrantId) {
+      return status.checkInClaude
+        ? { outcome: "unavailable", message: "Check for banked resets in Claude under Settings → Usage.", left: 0 }
+        : { outcome: "none", message: "No banked resets left on this account.", left: 0 };
     }
     if (!status.offer.usableNow) {
       return {
@@ -222,7 +341,7 @@ export class ClaudeAdapter implements FamilyAdapter {
     const organization = await this.organizationId(home);
     if (!organization) return { outcome: "error", message: "Couldn't tell which Claude organization this account belongs to.", left: null };
     try {
-      const response = await fetch(`${API}/api/organizations/${organization}/reset_rate_limits`, {
+      const response = await apiFetch(home, `${API}/api/organizations/${organization}/reset_rate_limits`, {
         method: "POST",
         headers: apiHeaders(token),
         body: JSON.stringify({ program: CLAUDE_RESET_PROGRAM, grant_id: status.nextGrantId, request_id: randomUUID() }),
@@ -246,17 +365,18 @@ export class ClaudeAdapter implements FamilyAdapter {
     let id = typeof account?.organizationUuid === "string" ? account.organizationUuid : null;
     if (!id) {
       const { command, prefix } = await providerCommand("claude");
-      const result = await run(command, [...prefix, "auth", "status", "--json"], { env: spawnEnv(await this.env(home)), timeoutMs: 30_000 });
+      const result = await run(command, [...prefix, "auth", "status", "--json"], { env: spawnEnv(await this.env(home), "claude"), timeoutMs: 30_000 });
       id = str(parseJsonObject(result.stdout)?.orgId);
     }
     return id && /^[0-9a-f-]{8,64}$/i.test(id) ? id : null;
   }
 
   async login(home: string | null, _method: LoginMethod): Promise<LoginHandle> {
+    if (isBedrockHome(home)) throw new Error("AWS Bedrock accounts use AWS credentials: change them from the account's card.");
     const { command, prefix } = await providerCommand("claude");
     const shim = await browserCaptureScript();
     const capture = join(tmpdir(), `zerosub-login-${randomBytes(6).toString("hex")}.url`);
-    const env = spawnEnv(await this.env(home));
+    const env = spawnEnv(await this.env(home), "claude");
     if (shim) {
       env.BROWSER = shim;
       env.ZEROSUB_BROWSER_OUT = capture;
@@ -265,13 +385,86 @@ export class ClaudeAdapter implements FamilyAdapter {
   }
 
   async logout(home: string): Promise<void> {
+    // Nothing is signed in: deleting the home (and its bedrock.json) is all removing it takes.
+    if (isBedrockHome(home)) return;
     const { command, prefix } = await providerCommand("claude");
-    const result = await run(command, [...prefix, "auth", "logout"], { env: spawnEnv(await this.env(home)), timeoutMs: 30_000 });
-    if (result.code === 0 || process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
-    // Don't leave a live refresh token behind in the keychain for a home that is about to be deleted.
-    await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", keychainService(home)], {
+    const result = await run(command, [...prefix, "auth", "logout"], { env: spawnEnv(await this.env(home), "claude"), timeoutMs: 30_000 });
+    if (process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
+    // Don't leave a live refresh token behind in the keychain for a home that is about to be deleted. The
+    // CLI's logout exits 0 even when its own delete of the entry failed, so the entry is checked either way.
+    const service = keychainService(home);
+    const removed = await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", service], {
       timeoutMs: 10_000,
     });
+    if (removed.code === 0 || removed.code === KEYCHAIN_ITEM_NOT_FOUND) return;
+    // Thrown so the cleanup tries again later, rather than deleting the home over a live entry.
+    const why = removed.timedOut ? "timed out" : removed.stderr.trim() || `exit ${removed.code}`;
+    const signedOut = result.code === 0 ? "Signed" : "Couldn't sign";
+    throw new Error(`${signedOut} ${home} out, but couldn't remove its keychain entry "${service}" (${why})`);
+  }
+
+  /**
+   * Which of `homes` a Claude process runs on right now (started with that `CLAUDE_CONFIG_DIR`: by
+   * Paseo, or its script in a terminal), so its home isn't moved under it (see `Service.placeHomes`).
+   */
+  async homesInUse(homes: readonly string[]): Promise<Set<string>> {
+    const found = new Set<string>();
+    if (homes.length === 0) return found;
+    await eachProcessEnvironment((line) => {
+      for (const home of homesInEnvironment(line, homes)) found.add(home);
+    });
+    return found;
+  }
+
+  holdsAccount(home: string): Promise<boolean> {
+    return claudeHomeHoldsAccount(home);
+  }
+
+  /**
+   * Why `home`'s folder stays where it is: on macOS its Keychain entry moves with it (see
+   * `copyCredentials`), and one too long to write through `security -i` can't. Claude Code's
+   * `mcpOAuth` records alone can make it that long. Null when it can move.
+   */
+  async homeStays(home: string): Promise<string | null> {
+    if (process.platform !== "darwin") return null; // Elsewhere the login lives in the home itself.
+    const secret = await readKeychainEntry(home);
+    // Every added home's entry is named alike, so it's as long written for the folder it would move to.
+    return secret !== null && addEntryCommand(home, secret) === null ? KEYCHAIN_TOO_LONG : null;
+  }
+
+  async copyCredentials(from: string, to: string): Promise<void> {
+    if (process.platform !== "darwin") return; // Elsewhere the login lives in the home itself.
+    const secret = await readKeychainEntry(from);
+    // Signed out, or copied before and the old entry already gone: nothing to carry over.
+    if (secret === null) return;
+    if (!secret.trimStart().startsWith("{") || !parseJsonObject(secret)) {
+      throw new Error(`the Keychain entry "${keychainService(from)}" isn't what Claude Code writes, so ZeroSub left it where it is`);
+    }
+    const there = await readKeychainEntry(to);
+    if (there === secret) return;
+    if (there !== null) {
+      throw new Error(
+        `the Keychain entry "${keychainService(to)}", where Claude Code looks for ${to}'s sign-in, already holds another one. Delete it if nothing uses it any more, or pick another folder.`,
+      );
+    }
+    await writeKeychainEntry(to, secret);
+    if ((await readKeychainEntry(to)) !== secret) {
+      await deleteKeychainEntry(to).catch(() => undefined);
+      throw new Error(`copying the Keychain entry "${keychainService(from)}" to "${keychainService(to)}" didn't read back the same`);
+    }
+  }
+
+  async dropCopiedCredentials(from: string, to: string): Promise<void> {
+    if (process.platform !== "darwin") return;
+    const copy = await readKeychainEntry(to);
+    if (copy !== null && copy === (await readKeychainEntry(from))) await deleteKeychainEntry(to);
+  }
+
+  async dropOldCredentials(from: string, to: string): Promise<boolean> {
+    if (process.platform !== "darwin") return true;
+    if ((await readKeychainEntry(to)) === null) return (await readKeychainEntry(from)) === null;
+    await deleteKeychainEntry(from);
+    return true;
   }
 
   detectLimit = detectClaudeLimit;
@@ -373,12 +566,79 @@ function friendlyFailure(message: string): string {
   return message.replace(/^Login failed:\s*/i, "Sign-in failed: ");
 }
 
+// --------------------------------------------------------------------------- network
+
+/**
+ * The proxy Claude Code would use for this account to reach `target`, or null when it goes direct:
+ * the environment Paseo starts it with (the daemon's, with the provider's configured `env` over it,
+ * and for the CLI login the proxy set for it here) and the account's `settings.json` `env` applied
+ * on top, as Claude Code does at startup, then its no-proxy list. An added account's settings file
+ * that doesn't parse is an error, not "no proxy", so the token never leaves from the daemon's own
+ * address. Main's sets nothing then (see `mainSettingsEnv`), and the CLI login keeps the proxy set
+ * for it here.
+ */
+export async function accountProxy(home: string | null, target: string): Promise<string | null> {
+  return proxyFor(await accountEnv(home), target);
+}
+
+/** The environment Claude Code starts with for this account (see `accountProxy`). */
+async function accountEnv(home: string | null): Promise<Record<string, string | undefined>> {
+  const env: Record<string, string | undefined> = { ...process.env, ...providerEnv("claude") };
+  if (!home) return { ...env, ...(await mainProxyEnv()), ...(await mainSettingsEnv()) };
+  const settings = await readJson(join(home, "settings.json"));
+  const overrides = settings && typeof settings === "object" && !Array.isArray(settings) ? (settings as { env?: unknown }).env : undefined;
+  if (overrides && typeof overrides === "object" && !Array.isArray(overrides)) {
+    for (const [key, value] of Object.entries(overrides)) if (typeof value === "string") env[key] = value;
+  }
+  return env;
+}
+
+function proxyFor(env: Record<string, string | undefined>, target: string): string | null {
+  const proxy = proxyFromEnv(env);
+  return proxy && !bypassesProxy(noProxyFromEnv(env), target) ? proxy : null;
+}
+
+/** Anthropic's edge (Cloudflare) answers this with the address it sees the request come from. */
+const TRACE = `${API}/cdn-cgi/trace`;
+
+/**
+ * The address Anthropic sees this account's requests come from: asked of its own host through the
+ * account's proxy, so a proxy that routes by domain takes the way Claude Code's requests take (an
+ * IP service elsewhere could go another way). Null when the account's requests go to another base
+ * URL: whatever is there reaches Anthropic from its own address.
+ */
+export async function claudeEgress(home: string | null): Promise<{ ip: string; country: string | null } | null> {
+  const env = await accountEnv(home);
+  const base = env.ANTHROPIC_BASE_URL?.trim();
+  if (base && hostOf(base) !== hostOf(API)) return null;
+  const response = await proxiedFetch(proxyFor(env, TRACE), TRACE, { signal: AbortSignal.timeout(10_000) });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const seen = parseTrace(await response.text());
+  if (!seen) throw new Error("The answer didn't say");
+  return seen;
+}
+
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).host;
+  } catch {
+    return null;
+  }
+}
+
+/** Calls Anthropic with an account's token from the address that account's Claude Code uses. */
+async function apiFetch(home: string | null, url: string, init: { method?: string; headers: Record<string, string>; body?: string; signal: AbortSignal }): Promise<Response> {
+  return proxiedFetch(await accountProxy(home, url), url, init);
+}
+
 // --------------------------------------------------------------------------- credentials (read-only)
 
 interface Credentials {
   accessToken: string | null;
+  refreshToken: string | null;
   expiresAt: number | null;
   scopes: string[] | null;
+  rateLimitTier: string | null;
 }
 
 function keychainAccount(): string {
@@ -410,6 +670,62 @@ export function keychainService(home: string | null): string {
 /** `security`'s exit code when there's no such keychain item (errSecItemNotFound). */
 const KEYCHAIN_ITEM_NOT_FOUND = 44;
 
+function keychainFailure(result: { code: number | null; stderr: string; timedOut: boolean }): string {
+  return result.timedOut ? "timed out" : result.stderr.trim() || `exit ${result.code}`;
+}
+
+/**
+ * The home's Keychain entry exactly as Claude Code wrote it, null when there's none. Only read to
+ * move it with its home (see `copyCredentials`); never logged or stored.
+ */
+async function readKeychainEntry(home: string): Promise<string | null> {
+  const service = keychainService(home);
+  const result = await run("/usr/bin/security", ["find-generic-password", "-a", keychainAccount(), "-w", "-s", service], { timeoutMs: 10_000 });
+  if (result.code === KEYCHAIN_ITEM_NOT_FOUND) return null;
+  if (result.code !== 0) throw new Error(`couldn't read the Keychain entry "${service}" (${keychainFailure(result)})`);
+  return result.stdout.endsWith("\n") ? result.stdout.slice(0, -1) : result.stdout;
+}
+
+/** Longest command `security -i` takes on one line. */
+const SECURITY_LINE_MAX = 4_000;
+
+/** Why a home whose Keychain entry is too long to copy stays where it is (see `ClaudeAdapter.homeStays`). */
+const KEYCHAIN_TOO_LONG = "its Keychain sign-in is too long to copy without showing it in the process list";
+
+/**
+ * The `security -i` command that writes `secret` as the home's Keychain entry, or null when it's
+ * longer than one line of `security -i`: the rest would run as another command.
+ */
+function addEntryCommand(home: string, secret: string): string | null {
+  const line = `add-generic-password -U -a "${keychainAccount()}" -s "${keychainService(home)}" -X "${Buffer.from(secret, "utf8").toString("hex")}"\n`;
+  return line.length > SECURITY_LINE_MAX ? null : line;
+}
+
+/**
+ * Writes the home's Keychain entry the way Claude Code does: through `security -i`'s standard
+ * input, so the secret never shows in the process list.
+ */
+async function writeKeychainEntry(home: string, secret: string): Promise<void> {
+  const service = keychainService(home);
+  const line = addEntryCommand(home, secret);
+  if (line === null) throw new Error(`the sign-in is too long to write to the Keychain entry "${service}" without showing it in the process list`);
+  const result = await run("/usr/bin/security", ["-i"], { input: line, timeoutMs: 10_000 });
+  if (result.code !== 0) throw new Error(`couldn't write the Keychain entry "${service}" (${keychainFailure(result)})`);
+}
+
+async function deleteKeychainEntry(home: string): Promise<void> {
+  const service = keychainService(home);
+  const result = await run("/usr/bin/security", ["delete-generic-password", "-a", keychainAccount(), "-s", service], { timeoutMs: 10_000 });
+  if (result.code !== 0 && result.code !== KEYCHAIN_ITEM_NOT_FOUND) {
+    throw new Error(`couldn't remove the Keychain entry "${service}" (${keychainFailure(result)})`);
+  }
+}
+
+/** The homes in `homes` a Claude process was started with (see `processes.ts`). */
+export function homesInEnvironment(line: string, homes: readonly string[]): string[] {
+  return inEnvironment(line, homes, ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"]);
+}
+
 /**
  * Whether the home's Keychain entry holds a Claude sign-in: false once it's gone or holds none, null
  * when it can't be read. Off macOS Claude Code keeps the sign-in in a file, and its answer stands.
@@ -433,9 +749,38 @@ function parseCredentials(raw: string): Credentials | null {
   if (!oauth) return null;
   return {
     accessToken: str(oauth.accessToken),
+    refreshToken: str(oauth.refreshToken),
+    rateLimitTier: str(oauth.rateLimitTier),
     expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
     scopes: Array.isArray(oauth.scopes) ? oauth.scopes.filter((scope): scope is string => typeof scope === "string") : null,
   };
+}
+
+/** Detects a file-backed import using the CLI's login. Secrets are compared only in memory. */
+export async function claudeCliCredentialConflict(home: string): Promise<"shared" | "indirect" | null> {
+  if (process.platform === "darwin") return null;
+  const file = join(storageDir(home).path, ".credentials.json");
+  const cliFile = join(storageDir(null).path, ".credentials.json");
+  const missing = (error: NodeJS.ErrnoException): null => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  };
+  const entry = await lstat(file).catch(missing);
+  if (!entry) return null;
+  const indirect = entry.isFile() ? null : "indirect";
+  const resolved = entry.isSymbolicLink() ? await stat(file).catch(missing) : entry;
+  if (!resolved?.isFile()) return indirect;
+
+  const cliEntry = await stat(cliFile).catch(missing);
+  if (!cliEntry?.isFile()) return indirect;
+  if (resolved.dev === cliEntry.dev && resolved.ino === cliEntry.ino) return "shared";
+
+  const [candidate, cli] = await Promise.all([
+    readFile(file, "utf8").catch(missing),
+    readFile(cliFile, "utf8").catch(missing),
+  ]);
+  const token = candidate && parseCredentials(candidate)?.refreshToken;
+  return token && cli && token === parseCredentials(cli)?.refreshToken ? "shared" : indirect;
 }
 
 /** Reads the account's OAuth token only to ask Anthropic for its usage. Never logged or stored. */

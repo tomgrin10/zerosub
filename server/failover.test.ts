@@ -69,11 +69,25 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
   const notes: Array<{ from: string | null; to: string; outcome: string; detail: string | null }> = [];
   const refetches: Array<{ direction?: string; limit?: number }> = [];
   const agent = { id: AGENT, provider: "claude", status: "idle", archivedAt: null, lastUserMessageAt: "2026-09-23T07:00:00.000Z" };
+  /** Paseo 0.17's background-work handle: off (an older Paseo) until a test turns it on. */
+  const work = {
+    supported: false,
+    items: [] as Array<{ id: string; kind: string; description: string | null; command?: string; canStop?: boolean }>,
+    stopped: [] as string[],
+  };
+  const backgroundWork = {
+    list: async () => work.items,
+    stop: async (item: { id: string }) => {
+      work.stopped.push(item.id);
+      work.items = work.items.filter((entry) => entry.id !== item.id);
+    },
+  };
   const paseo = {
     config: { get: async () => ({ config: { providers: {} } }) },
     agents: {
       list: async () => ({ entries: [{ agent }], pageInfo: { hasMore: false, nextCursor: null } }),
       ref: () => ({
+        ...(work.supported ? { backgroundWork } : {}),
         refresh: async () => ({ agent }),
         send: async (text: string) => void sent.push(text),
         timeline: {
@@ -87,7 +101,7 @@ function fakePaseo(recent: readonly Row[] | (() => Promise<{ entries: readonly R
       }),
     },
   };
-  return { paseo, sent, notes, refetches, agent };
+  return { paseo, sent, notes, refetches, agent, work };
 }
 
 interface SetUpOptions {
@@ -1560,6 +1574,74 @@ describe("a move Session Guard asks for before the limit", () => {
     off.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
     expect((await off.service.moveBeforeLimit(off.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
     for (const run of [limited, closed, helper, off]) expect(run.reopened).toEqual([]);
+  });
+
+  const withJobs = async () => {
+    const run = await setUp(nearly(), unused);
+    run.work.supported = true;
+    run.work.items = [{ id: "b1", kind: "shell", description: "Run the test suite", command: "npm test", canStop: true }];
+    (run.agent as Record<string, unknown>).backgroundWork = { count: 1 };
+    return run;
+  };
+
+  it("says what it waits for, naming the background work", async () => {
+    const { service, paseo, reopened } = await withJobs();
+    const result = await service.moveBeforeLimit(paseo as never, AGENT, HELLO);
+    expect(result).toMatchObject({ outcome: "waiting", waitingFor: "background", stopped: [] });
+    expect(result.backgroundWork).toEqual([{ kind: "shell", description: "Run the test suite", command: "npm test" }]);
+    expect(reopened).toEqual([]);
+    const busy = await setUp(nearly(), unused);
+    busy.agent.status = "running";
+    expect(await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "waiting", waitingFor: "turn", backgroundWork: [] });
+  });
+
+  it("stops the background work and moves at once when asked to", async () => {
+    const { service, paseo, reopened, work, notes, store } = await withJobs();
+    const result = await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true });
+    expect(result).toMatchObject({ outcome: "moved", waitingFor: null, backgroundWork: [] });
+    expect(result.stopped).toEqual([{ kind: "shell", description: "Run the test suite", command: "npm test" }]);
+    expect(work.stopped).toEqual(["b1"]);
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ to: "seat", reason: "near_limit", outcome: "switched", detail: "Its background job was stopped to move it." });
+  });
+
+  it("asked to stop work on a Paseo that can't list it, still moves and counts what the reopen ended", async () => {
+    const run = await setUp(nearly(), unused);
+    (run.agent as Record<string, unknown>).backgroundWork = { count: 2 };
+    const result = await run.service.moveBeforeLimit(run.paseo as never, AGENT, HELLO, { stopBackgroundWork: true });
+    expect(result.outcome).toBe("moved");
+    expect(result.stopped).toEqual([{ kind: "shell", description: null, command: null }, { kind: "shell", description: null, command: null }]);
+    expect(run.reopened).toEqual([AGENT]);
+  });
+
+  it("isn't held back by work the daemon owns, which outlives the move", async () => {
+    const { service, paseo, reopened, work } = await withJobs();
+    work.items = [
+      { id: "daemon:heartbeat:h1", kind: "heartbeat", description: "Check the deploy" },
+      { id: "daemon:change-request-watch:w1", kind: "monitor", description: "Watch example/app#12" },
+    ];
+    const result = await service.moveBeforeLimit(paseo as never, AGENT, HELLO);
+    expect(result).toMatchObject({ outcome: "moved", stopped: [] });
+    expect(work.stopped).toEqual([]);
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("asking again for a move that waits isn't counted against the bounce guard", async () => {
+    const { service, paseo, reopened } = await withJobs();
+    for (let ask = 0; ask < 6; ask += 1) expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).outcome).toBe("moved");
+    expect(reopened).toEqual([AGENT]);
+  });
+
+  it("never moves an agent the user pinned, even asked to stop its work", async () => {
+    const { service, paseo, reopened, store } = await withJobs();
+    await store.update((draft) => {
+      draft.bindings[AGENT] = { accountId: MAIN, source: "user", at: new Date().toISOString() };
+    });
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).outcome).toBe("refused");
+    expect(reopened).toEqual([]);
+    expect((await store.read()).bindings[AGENT]).toMatchObject({ accountId: MAIN, source: "user" });
   });
 
   it("keeps the bounce guard", async () => {

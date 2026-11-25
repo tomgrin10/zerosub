@@ -4,8 +4,9 @@ This is `tomgrin10/zerosub`, a fork of `kapybara-org/zerosub` for Tom's setup. I
 in Smart Session, and small general changes go upstream (Tom's decision, 2026-11-19). Until upstream releases the two
 PRs Smart Session needs, the fork is the latest upstream release plus the smallest set of commits on top:
 
-- upstream PR #107 (a pin with `allowLimited: true` keeps an agent on a limited account) and #108
-  (`zerosub.agents.move_before_limit`, with `stopBackgroundWork`), cherry-picked from their upstream branches;
+- upstream PR #107 (a pin with `allowLimited: true` keeps an agent on a limited account; a quota maximum still
+  applies) and #108 (`zerosub.agents.move_before_limit`, with `stopBackgroundWork`, `reason`, `retryable` and
+  `accountId`), cherry-picked from their reviewed upstream heads;
 - loading a registry the old `1.5.1-pace` fork wrote (binding `source: "pace"` reads as `balance`);
 - this file, `CLAUDE.md` and `scripts/install-vm.sh`.
 
@@ -50,15 +51,16 @@ beta by default, except hotfixes (a hotfix skips the beta, not the permission). 
   threshold (below 100%), where ZeroSub doesn't see a limit yet, so it asks: `zerosub.agents.move_before_limit` moves
   that one agent, between turns, to the account the guard names (binding `auto`). ZeroSub's guards apply: automatic
   switching on, a usable subscription target, an open agent whose conversation can move, the bounce guard, and the
-  reopen guards (never wakes a closed agent; waits for a turn or background jobs, and answers `waiting` with
-  `waitingFor` and the jobs it waits for). Never a session the user pinned (`source: user`). Tests: "a move asked
-  for before the limit" in `server/failover.test.ts`.
+  reopen guards (never wakes a closed agent; a turn or background jobs answer `waiting` with `waitingFor`, the jobs,
+  and `reason`, and queue nothing: the caller asks again). The README's "The `zerosub.agents.move_before_limit` RPC"
+  is the contract. Never a session the user pinned (`source: user`). Tests: "a move asked for before the limit" in
+  `server/failover.test.ts`.
 - **A move stops background work only when its caller asked for exactly that.** `move_before_limit` with
   `stopBackgroundWork: true` stops the jobs Paseo can stop, reopens, and returns every job the move ended in
   `stopped`, so the caller can tell the agent what to start again. No other path stops jobs. Work the daemon owns
   (heartbeats, change-request watches) outlives a reopen, so it never holds a move back.
-- A move that waited and was lost to a plugin reload is finished by upstream's alignment check (every 30 s), which
-  replaced the fork's `moveDrifted`.
+- From 1.31.0-pace.16 a `waiting` move writes nothing (#108's review), so there is no waiting move for a reload to
+  lose; Smart Session asks again once the turn or the work ends.
 
 ## Installing a build on the VM (for the orchestrator)
 

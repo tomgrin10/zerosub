@@ -41,7 +41,7 @@ import {
 } from "../shared/model";
 import { capsAccount, limitedModelPick, limitedPick, windowScope } from "../shared/format";
 import { DEFAULT_CONTINUE_PROMPT, type Preferences } from "../shared/preferences";
-import type { BackgroundJob, RedeemResult, ReopenSummary } from "../shared/rpc";
+import type { BackgroundJob, MoveBeforeLimitReason, MoveBeforeLimitResult, RedeemResult, ReopenSummary } from "../shared/rpc";
 import { SWITCH_ROW_KIND, SWITCH_ROW_VERSION, type SwitchRow } from "../shared/timeline";
 import {
   applyEnv,
@@ -101,7 +101,7 @@ import { maskProxy, normalizeProxy } from "./proxy";
 import { Reopener, hostCanReload } from "./reopen";
 import { SwitchGuard } from "./switch-guard";
 import { loadReadings, mergeUsage, pastReset, saveReadings, showLimit } from "./usage";
-import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, mostAvailable, paceScore, paceView, PENDING_MS, quotaCeilingHit, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
+import { canStandIn, chooseAccount, fiveHourWindow, headroomScore, isLastResort, isLimited, isPaidStandIn, isLimitedFor, isUsable, keepsPastLimit, mostAvailable, paceScore, paceView, PENDING_MS, quotaCeilingHit, scopeCoversModel, weeklyWindow, withBankedReset, type Pacing, type RouteDecision, type RouteInput } from "./routing";
 import {
   ALL_SOURCES,
   MAIN_ACCOUNT_ID,
@@ -125,7 +125,7 @@ import {
 type PaseoApi = PluginHookContext["paseo"];
 type TurnEnded = PluginLifecycleEvents["agent.turn_ended"];
 
-const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor" };
+const PROVIDER_NAME: Record<Family, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", grok: "Grok", cursor: "Cursor", antigravity: "Antigravity" };
 /** How often to read usage: accounts in use, the defaults, and the rest. Adapters space reads further. */
 const USAGE_BUSY_MS = 60_000;
 const USAGE_DEFAULT_MS = 5 * 60_000;
@@ -415,24 +415,11 @@ function hasBackgroundWork(agent: AgentInfo): boolean {
   return agent.backgroundWork > 0;
 }
 
-/** `zerosub.agents.move_before_limit`'s reply (see the RPC). */
-type MoveBeforeLimitReply = {
-  outcome: "moved" | "waiting" | "already" | "refused";
-  detail: string | null;
-  waitingFor: "turn" | "background" | null;
-  backgroundWork: BackgroundJob[];
-  stopped: BackgroundJob[];
-};
+/** Reasons a caller can retry as they are: the agent or ZeroSub is busy, not the request wrong. */
+const RETRYABLE_MOVE_REASONS: ReadonlySet<MoveBeforeLimitReason | null> = new Set(["busy_turn", "background_work", "switch_guard", "in_progress", "reload_failed"]);
 
-/** What a caller asks of one reopen beyond the default, and what it learns back (see `reopenAgent`). */
-interface ReopenAsk {
-  /** Stop the agent's background work and reopen it, rather than wait for the work to end. */
-  stopBackgroundWork: boolean;
-  /** Set when the reopen waits: for a running turn, or background work. */
-  waitingFor?: "turn" | "background";
-  /** The background work it waits for, or that it stopped to reopen. */
-  jobs?: BackgroundJob[];
-}
+/** `zerosub.agents.move_before_limit`'s reply (see the RPC). */
+type MoveBeforeLimitReply = MoveBeforeLimitResult;
 
 /** One item of Paseo's background-work list, as a plugin's agent handle returns it. */
 interface ListedWork { id: string; kind?: string; description?: string | null; command?: string; canStop?: boolean }
@@ -441,8 +428,16 @@ interface BackgroundWorkHandle {
   stop(item: ListedWork, options?: { timeout?: number }): Promise<void>;
 }
 
-/** Work the daemon itself runs for an agent (Paseo gives its ids this prefix). It outlives a reopen. */
-const DAEMON_WORK_PREFIX = "daemon:";
+/**
+ * Work the daemon itself runs for an agent, by the id prefix Paseo gives it: its own jobs (`daemon:`)
+ * and heartbeats (`heartbeat:`). It outlives a reopen.
+ */
+const DAEMON_WORK_PREFIXES = ["daemon:", "heartbeat:"];
+
+function daemonOwned(item: ListedWork): boolean {
+  const id = String(item.id);
+  return DAEMON_WORK_PREFIXES.some((prefix) => id.startsWith(prefix));
+}
 
 /** The agent's background-work handle, on a Paseo that has one; null otherwise. */
 function backgroundWorkOf(paseo: PaseoApi, agentId: string): BackgroundWorkHandle | null {
@@ -460,7 +455,7 @@ async function workAReopenEnds(paseo: PaseoApi, agentId: string): Promise<Listed
   if (!handle) return null;
   try {
     const items = await handle.list({ timeout: 5_000 });
-    return Array.isArray(items) ? items.filter((item) => !String(item.id).startsWith(DAEMON_WORK_PREFIX)) : null;
+    return Array.isArray(items) ? items.filter((item) => !daemonOwned(item)) : null;
   } catch {
     return null;
   }
@@ -468,10 +463,19 @@ async function workAReopenEnds(paseo: PaseoApi, agentId: string): Promise<Listed
 
 /** The jobs as the caller reads them; unnamed ones fill up to the count Paseo reported. */
 function describeWork(listed: ListedWork[] | null, count: number): BackgroundJob[] {
-  const jobs: BackgroundJob[] = (listed ?? []).map((item) => ({ kind: item.kind ?? "other", description: item.description ?? null, command: item.command ?? null }));
+  const jobs: BackgroundJob[] = (listed ?? []).map(describeJob);
   while (listed === null && jobs.length < count) jobs.push({ kind: "other", description: null, command: null });
   return jobs;
 }
+
+function describeJob(item: ListedWork): BackgroundJob {
+  return { kind: item.kind ?? "other", description: item.description ?? null, command: item.command ?? null };
+}
+
+/** Longest a single stop of background work is waited for. */
+const STOP_WORK_MS = 10_000;
+/** Time kept back for the reload itself when stopping background work before a move. */
+const RELOAD_RESERVE_MS = 5_000;
 
 function sameBinding(a: Binding | undefined, b: Binding | undefined): boolean {
   return a?.accountId === b?.accountId && a?.at === b?.at;
@@ -554,7 +558,7 @@ export class Service {
   private readonly identityCheckedAt = new Map<string, number>();
   private readonly availability = new Map<Family, { ok: boolean; detail: string | null; at: number }>();
   private readonly logins = new Map<string, LoginSession>();
-  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex(), cursor: new Mutex() };
+  private readonly loginLocks: Record<Family, Mutex> = { claude: new Mutex(), codex: new Mutex(), pi: new Mutex(), grok: new Mutex(), cursor: new Mutex(), antigravity: new Mutex() };
   /** Homes of API accounts being set up, which cleanup must leave alone. */
   private readonly creatingHomes = new Set<string>();
   /**
@@ -1776,9 +1780,25 @@ export class Service {
     }
 
     if (!this.prefs.autoSwitch) return;
-    if (problem.kind === "limit" && keptAtLimit((await this.store.read()).bindings[agentId], account.id)) {
+    if (problem.kind === "limit" && this.keptAtLimit(await this.store.read(), agentId, account.id)) {
       // Pinned there with `allowLimited`: its work belongs on this account, so it stops where it is.
+      // The row says so, so a caller sees the stop was intended (`allowLimited`), not a lack of room.
       console.log(`[ZeroSub] ${agentId} is kept on ${account.label} past its limit; not moving it`);
+      await this.appendRow(paseo, agentId, {
+        family,
+        from: account.label,
+        to: account.label,
+        reason: "limit",
+        resetsAt,
+        continued: false,
+        continuedIn: null,
+        toFamily: null,
+        toProvider: null,
+        outcome: "stayed",
+        allowLimited: true,
+        detail: `It's pinned to ${account.label} past its limit, so ZeroSub left it there. Pick another account from the account button to carry on elsewhere.`,
+        at: new Date(now).toISOString(),
+      });
       return;
     }
     if (elsewhere) {
@@ -2292,7 +2312,11 @@ export class Service {
     const now = Date.now();
     const model = this.agentModels.get(agentId);
     const routed = this.routeFor(state, agentId, family, exhausted, paid);
-    if (routed && routed.account.id !== exhausted && !routed.skipped && isUsable(routed.account, now, model, this.usage.get(routed.account.id))) return { account: routed.account, pin: false };
+    if (routed && routed.account.id !== exhausted && !routed.skipped) {
+      const usage = this.usage.get(routed.account.id);
+      // A pin with `allowLimited` holds at a limit too: pinning the agent elsewhere would undo it.
+      if (isUsable(routed.account, now, model, usage) || keepsPastLimit(routed.account, state.bindings[agentId], now, model, usage)) return { account: routed.account, pin: false };
+    }
     const roomiest = mostAvailable(state, family, (id) => this.usage.get(id), now, new Set([exhausted]), paid, this.pacing(now), model);
     return roomiest && { account: roomiest, pin: true };
   }
@@ -2333,7 +2357,7 @@ export class Service {
           families[agent.provider] === family &&
           this.runningOn(state, agent.id, family) === accountId &&
           !(reason === "pacing" && state.bindings[agent.id]?.source === "user") &&
-          !(reason === "limit" && keptAtLimit(state.bindings[agent.id], accountId)) &&
+          !(reason === "limit" && this.keptAtLimit(state, agent.id, accountId)) &&
           (!scope || scopeCoversModel(scope, this.agentModels.get(agent.id))),
       )
       .map((agent) => agent.id);
@@ -2362,6 +2386,8 @@ export class Service {
         if (this.runningOn(latest, agentId, family) !== accountId) continue;
         // The user may have picked its account since the pass listed it.
         if (reason === "pacing" && latest.bindings[agentId]?.source === "user") continue;
+        // Or pinned it there with `allowLimited` since.
+        if (reason === "limit" && this.keptAtLimit(latest, agentId, accountId)) continue;
         let move: { account: StoredAccount; pin: boolean } | undefined;
         if (reason === "pacing") {
           // Turning either preference off stops a pass that's already running.
@@ -3430,6 +3456,12 @@ export class Service {
     return label && row.outcome === "switched" ? { ...row, to: label } : row;
   }
 
+  /** The agent is pinned to `accountId` with `allowLimited`, and the account may keep it past a limit (see `keepsPastLimit`). */
+  private keptAtLimit(state: StoredState, agentId: string, accountId: string): boolean {
+    const account = findAccount(state, accountId);
+    return !!account && keepsPastLimit(account, state.bindings[agentId], Date.now(), this.agentModels.get(agentId), this.usage.get(account.id));
+  }
+
   private atQuotaCeiling(state: StoredState, accountId: string | undefined, now: number, model?: string | null): boolean {
     const account = findAccount(state, accountId);
     return !!account && !!quotaCeilingHit(account, this.usage.get(account.id), now, model);
@@ -3487,7 +3519,7 @@ export class Service {
   private async reopenAgent(
     paseo: PaseoApi,
     agentId: string,
-    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean; ask?: ReopenAsk } = {},
+    options: { row?: SwitchRow | null; settle?: boolean; background?: boolean; unattended?: boolean; sameConversation?: boolean } = {},
   ): Promise<ReopenResult> {
     const { row = null, settle = false, background = false, unattended = background } = options;
     let info: AgentInfo | null;
@@ -3501,10 +3533,7 @@ export class Service {
       return unchecked(error);
     }
     if (!info) return { outcome: "closed" };
-    if (busy(info)) {
-      if (options.ask) options.ask.waitingFor = "turn";
-      return this.defer(agentId, row, unattended);
-    }
+    if (busy(info)) return this.defer(agentId, row, unattended);
     // Reloading an archived agent would unarchive it; a closed one routes itself when it next opens.
     if (info.archived || info.status === "closed") return { outcome: "closed" };
     const family = (await this.families.resolve(paseo))[info.provider];
@@ -3532,24 +3561,10 @@ export class Service {
     }
     if (!latest || latest.archived || latest.status === "closed") return { outcome: "closed" };
     const now = Date.now();
-    // Background work holds an unattended move back, unless the caller asked to stop it. Work the
-    // daemon owns outlives the reopen, so it doesn't count once Paseo can list it.
-    const listed = unattended && hasBackgroundWork(latest) ? await workAReopenEnds(paseo, agentId) : null;
-    const working = unattended && hasBackgroundWork(latest) && (listed === null || listed.length > 0);
-    const ask = options.ask;
-    if (working && ask?.stopBackgroundWork && !busy(latest)) {
-      const handle = backgroundWorkOf(paseo, agentId);
-      for (const item of listed ?? []) {
-        if (item.canStop && handle) await handle.stop(item, { timeout: 10_000 }).catch((error: unknown) => log(`stopping background work of ${agentId} failed`, error));
-      }
-      ask.jobs = describeWork(listed, latest.backgroundWork);
-    } else if (busy(latest) || working || (background && this.recentlyActive(latest, now))) {
-      if (ask) {
-        ask.waitingFor = working && !busy(latest) ? "background" : "turn";
-        if (ask.waitingFor === "background") ask.jobs = describeWork(listed, latest.backgroundWork);
-      }
-      return this.defer(agentId, row, unattended);
-    }
+    // Background work holds an unattended move back. Work the daemon owns outlives the reopen, so it
+    // doesn't count once Paseo can list it.
+    const working = unattended && (await this.workingInBackground(paseo, latest)) !== null;
+    if (busy(latest) || working || (background && this.recentlyActive(latest, now))) return this.defer(agentId, row, unattended);
     const reload: Reload = { opens: 0 };
     this.reloads.set(agentId, reload);
     let result: Awaited<ReturnType<Reopener["reopen"]>>;
@@ -4031,7 +4046,7 @@ export class Service {
       // Renewing a sign-in can take longer than Paseo waits for an answer; later readings show at the next poll.
       await settles(Promise.allSettled(accounts.map(async (account) => {
         await this.refreshUsage(account.id, true, true);
-        if (account.family === "claude") await this.refreshIdentity(account.id, true);
+        if (account.family === "claude" || account.family === "antigravity") await this.refreshIdentity(account.id, true);
       })), USAGE_REPLY_MS);
     }
     void this.prune(paseo).catch(() => undefined);
@@ -4066,6 +4081,7 @@ export class Service {
         pendingAccountId: pending,
         waiting: !pending ? null : this.movesWhen(state, agent, family, pending, accountId, canReopen, now),
         movable: this.adapters[family].portable || !agent.hasHistory,
+        allowLimited: binding?.allowLimited === true && binding.accountId === accountId,
         // Named, or being named as its session opened: the list read here may be from before that.
         inComposer: agent.named === true || (agent.named === false && this.naming.has(agent.id) && !this.unnamed.has(agent.id)),
       });
@@ -4175,6 +4191,7 @@ export class Service {
     });
 
     return {
+      version: 1 as const,
       accounts,
       agents: routes,
       logins: [...this.logins.values()].map((login) => login.view),
@@ -4362,6 +4379,10 @@ export class Service {
       await this.store.update((draft) => {
         previous = draft.defaults[account.family] ?? null;
         draft.defaults[account.family] = account.id;
+        // Explicitly choosing an Antigravity default can pair entries added before identity was available.
+        const target = account.family === "antigravity" ? findAccount(draft, account.id) : undefined;
+        const peer = target && subscriptionLoginPeer(draft, target);
+        if (target?.signedIn && !target.disabled && peer?.signedIn) preferSubscriptionLogin(draft, target, peer, portable);
       });
       if (portable && !this.prefs.moveAgentsOnDefaultChange) {
         // The new default is for what comes next: open agents stay on the account they run on. If they
@@ -4414,13 +4435,13 @@ export class Service {
     await this.store.update((draft) => {
       const target = findAccount(draft, accountId);
       if (!target) return;
-      const peer = claudeLoginPeer(draft, target);
+      const peer = subscriptionLoginPeer(draft, target);
       if (enabled && peer && !peer.disabled && !target.signedIn) {
         throw new Error(`Sign in to ${target.label} before switching away from ${peer.label}.`);
       }
       target.disabled = !enabled;
       delete target.pausedFor;
-      if (enabled && target.signedIn && peer) preferClaudeLogin(draft, target, peer);
+      if (enabled && target.signedIn && peer) preferSubscriptionLogin(draft, target, peer, this.adapters[target.family].portable);
       if (!enabled) dropNextPick(draft, target);
     });
     console.log(`[ZeroSub] ${account.label} is ${enabled ? "enabled" : "disabled"}`);
@@ -4544,11 +4565,9 @@ export class Service {
   /**
    * Moves one agent to an account, or back to following the default. With automatic switching on,
    * an account at its limit is refused, since the agent would be moved straight off it. A failover
-   * under way finishes first; the agent then moves to the account picked here.
-   */
-  /**
-   * Pins an agent to an account, or (`null`) lets it follow the default again. With `allowLimited`, an
-   * account at its limit is taken too, and the agent stays on it while it's limited (see `Binding`).
+   * under way finishes first; the agent then moves to the account picked here. With `allowLimited`,
+   * an account at a provider limit is taken too, and the agent stays on it while it's limited (see
+   * `Binding`); a quota maximum still refuses it. Only agents that move in place take the flag.
    */
   async setAgentAccount(
     paseo: PaseoApi,
@@ -4570,14 +4589,18 @@ export class Service {
     if (!target || target.family !== family) throw new Error("That account can't be used with this agent.");
     if (!target.signedIn) throw new Error(`${target.label} is signed out. Sign it in first.`);
     if (accountId && target.disabled) throw new Error(`${target.label} is disabled. Enable it in Accounts first.`);
-    if (accountId && this.prefs.autoSwitch && !allowLimited) {
+    // A thread that can't move in place is handed off to a new agent instead, which a pin past the
+    // limit couldn't follow: refused rather than ignored.
+    if (allowLimited && !adapter.portable) throw new Error(`${FAMILY_LABEL[family]} agents can't be kept on an account past its limit.`);
+    if (accountId && this.prefs.autoSwitch) {
       const now = Date.now();
-      if (isLimited(target, now)) throw new Error(limitedPick(target.label));
+      if (!allowLimited && isLimited(target, now)) throw new Error(limitedPick(target.label));
       // Only a limit of this agent's own model refuses it; another model's leaves the account open.
       const model = await this.modelOf(paseo, agentId);
+      // A quota maximum is the user's own ceiling, so `allowLimited` doesn't lift it.
       if (this.atQuotaCeiling(state, target.id, now, model)) throw new Error(`${target.label} reached its quota maximum. Raise it in Accounts or pick another account.`);
       const scope = Object.entries(target.modelLimits).find(([name, limit]) => Date.parse(limit.until) > now && scopeCoversModel(name, model))?.[0];
-      if (scope) throw new Error(limitedModelPick(target.label, scope));
+      if (scope && !allowLimited) throw new Error(limitedModelPick(target.label, scope));
     }
 
     if (!adapter.portable) {
@@ -4659,6 +4682,7 @@ export class Service {
     await this.store.update((draft) => {
       const account = findAccount(draft, accountId);
       if (!account) throw new Error("That account no longer exists.");
+      if (account.family === "antigravity") throw new Error("Antigravity usage is display-only.");
       const ceilings = { ...account.quotaCeilings };
       if (percent === 100) delete ceilings[windowId];
       else ceilings[windowId] = percent;
@@ -4667,12 +4691,24 @@ export class Service {
     if (this.paseo) void this.alignSessions(this.paseo).catch((error: unknown) => log("aligning agents failed", error));
   }
 
+  /** The background work a reopen would end, or null when there's none (work the daemon owns doesn't count). */
+  private async workingInBackground(paseo: PaseoApi, info: AgentInfo): Promise<{ listed: ListedWork[] | null; jobs: BackgroundJob[] } | null> {
+    if (!hasBackgroundWork(info)) return null;
+    const listed = await workAReopenEnds(paseo, info.id);
+    if (listed !== null && listed.length === 0) return null;
+    return { listed, jobs: describeWork(listed, info.backgroundWork) };
+  }
+
   /**
    * Moves one agent, between turns, to `accountId` before its own account is at its limit (see the
    * RPC). It's an automatic move, as after a limit: the binding is `auto`, the timeline says why, and
-   * the guards are the same. Automatic switching on, a usable subscription account of the agent's
-   * provider, a live agent whose conversation can move, not one the user pinned, the switch guard,
-   * and `reopenAgent`, which never wakes a closed agent and waits for a turn or background work.
+   * the guards are the same. Automatic switching on, a subscription account of the agent's provider
+   * that routing could put it on by itself, a live agent whose conversation can move, not one the
+   * user pinned, and the switch guard.
+   *
+   * Nothing is written until the agent can move now: a running turn or background work answers
+   * `waiting` (retry later), and a reload that doesn't land puts the binding back. The answer comes
+   * within `REPLY_WAIT_MS`; a reload that outlasts it answers `pending` and finishes on its own.
    */
   async moveBeforeLimit(
     paseo: PaseoApi,
@@ -4680,37 +4716,90 @@ export class Service {
     accountId: string,
     options: { stopBackgroundWork?: boolean } = {},
   ): Promise<MoveBeforeLimitReply> {
+    const replyBy = Date.now() + REPLY_WAIT_MS;
     this.attach(paseo);
-    const reply = (outcome: MoveBeforeLimitReply["outcome"], detail: string | null, more: Partial<MoveBeforeLimitReply> = {}): MoveBeforeLimitReply =>
-      ({ outcome, detail, waitingFor: null, backgroundWork: [], stopped: [], ...more });
-    const refused = (detail: string) => reply("refused", detail);
-    if (!this.prefs.autoSwitch) return refused("Automatic switching is off.");
+    const stopWork = options.stopBackgroundWork === true;
+    let liveOn: string | null = null;
+    const reply = (outcome: MoveBeforeLimitReply["outcome"], reason: MoveBeforeLimitReason | null, detail: string | null, more: Partial<MoveBeforeLimitReply> = {}): MoveBeforeLimitReply =>
+      ({ outcome, reason, retryable: RETRYABLE_MOVE_REASONS.has(reason), accountId: liveOn, detail, waitingFor: null, backgroundWork: [], stopped: [], ...more });
+    const waitTurn = (stopped: BackgroundJob[] = []) =>
+      reply("waiting", "busy_turn", "It's in a turn. Ask again once it ends.", { waitingFor: "turn", stopped });
+    const waitWork = (jobs: BackgroundJob[], stopped: BackgroundJob[] = []) =>
+      reply("waiting", "background_work", "It has background work running. Ask again once it ends, or with stopBackgroundWork.", { waitingFor: "background", backgroundWork: jobs, stopped });
+
+    if (!this.prefs.autoSwitch) return reply("refused", "auto_switch_off", "Automatic switching is off.");
     const info = await agentInfo(paseo, agentId);
-    if (!info || info.archived || info.status === "closed") return refused("The agent isn't open.");
+    if (!info || info.archived || info.status === "closed") return reply("refused", "not_open", "The agent isn't open.");
     const family = (await this.families.resolve(paseo))[info.provider];
-    if (!family || !this.adapters[family].portable) return refused("This agent's conversation can't change accounts.");
+    if (!family || !this.adapters[family].portable) return reply("refused", "unsupported_provider", "This agent's conversation can't change accounts in place.");
     const state = await this.store.read();
+    const current = this.runningOn(state, agentId, family);
+    liveOn = current ?? null;
     const target = findAccount(state, accountId);
     const now = Date.now();
     // A limit of one model's window rules an account out only for agents on that model.
     await withTimeout(this.modelOf(paseo, agentId), 3_000);
-    if (!target || target.family !== family || !isUsable(target, now, this.agentModels.get(agentId), this.usage.get(target.id)) || isPaidStandIn(target, this.prefs.paidApiFallback)) {
-      return refused("That account can't take it now.");
+    // Only where routing could move the agent by itself: no API key or paid stand-in, under every quota maximum.
+    if (!target || target.family !== family || !canStandIn(target, now, this.agentModels.get(agentId), this.usage.get(target.id)) || isPaidStandIn(target, this.prefs.paidApiFallback)) {
+      return reply("refused", "ineligible_target", "That account can't take it now.");
     }
-    const current = this.runningOn(state, agentId, family);
-    if (current === target.id) return reply("already", null);
-    if (state.bindings[agentId]?.source === "user") return refused("It stays on the account picked for it.");
-    // Asking again for a move that already waits (to stop its background work now, say) is the same
-    // move: the switch guard doesn't count it twice.
-    const again = this.deferred.has(agentId) && state.bindings[agentId]?.accountId === target.id && state.bindings[agentId]?.source === "auto";
-    if (!again && !this.switchGuard.allows(agentId, now)) return refused("It changed accounts too often just now.");
+    if (current === target.id) return reply("already", null, null);
+    if (state.bindings[agentId]?.source === "user") return reply("refused", "user_pinned", "It stays on the account picked for it.");
+    if (busy(info)) return waitTurn();
+    let work = await this.workingInBackground(paseo, info);
+    if (work && !stopWork) return waitWork(work.jobs);
+    if (!this.switchGuard.allows(agentId, now)) return reply("refused", "switch_guard", "It changed accounts too often just now.");
     const release = this.tryClaim(agentId);
-    if (!release) return refused("It's changing accounts already.");
+    if (!release) return reply("refused", "in_progress", "It's changing accounts already.");
+    let handedOff = false;
     try {
-      if (!again) {
-        await this.pin(agentId, target.id, state.bindings[agentId]);
-        this.switchGuard.note(agentId, now);
+      // Stop what Paseo can stop, within the time left to answer; the reload ends the rest.
+      const stopped: BackgroundJob[] = [];
+      const handle = work ? backgroundWorkOf(paseo, agentId) : null;
+      for (const item of work?.listed ?? []) {
+        if (!item.canStop || !handle) continue;
+        const left = replyBy - Date.now() - RELOAD_RESERVE_MS;
+        if (left <= 0) break;
+        const done = await handle.stop(item, { timeout: Math.min(STOP_WORK_MS, left) }).then(() => true, (error: unknown) => {
+          log(`stopping background work of ${agentId} failed`, error);
+          return false;
+        });
+        if (done) stopped.push(describeJob(item));
       }
+      // Stopping takes a while: a turn may have started, or new work, which the reload would cut short.
+      const fresh = await agentInfo(paseo, agentId);
+      if (!fresh || fresh.archived || fresh.status === "closed") return reply("refused", "not_open", "The agent isn't open.", { stopped });
+      if (busy(fresh)) return waitTurn(stopped);
+      work = await this.workingInBackground(paseo, fresh);
+      const unstoppable = (work?.listed ?? []).filter((item) => !item.canStop);
+      // Left running: work it couldn't stop in time, or new work. Work Paseo can't stop is ended by the reload.
+      if (work && (!stopWork || (work.listed !== null && work.listed.length > unstoppable.length))) {
+        return waitWork(work.jobs, stopped);
+      }
+      const ended = [...stopped, ...(work ? (work.listed === null ? work.jobs : unstoppable.map(describeJob)) : [])];
+
+      const seen = state.bindings[agentId];
+      let wrote: Binding | undefined;
+      await this.store.update((draft) => {
+        if (!sameBinding(draft.bindings[agentId], seen)) return;
+        wrote = { accountId: target.id, source: "auto", at: new Date().toISOString() };
+        draft.bindings[agentId] = wrote;
+      });
+      if (!wrote) {
+        const picked = (await this.store.read()).bindings[agentId]?.source === "user";
+        return picked
+          ? reply("refused", "user_pinned", "It stays on the account picked for it.", { stopped })
+          : reply("refused", "in_progress", "It's changing accounts already.", { stopped });
+      }
+      const pinned = wrote;
+      /** Puts the binding back as it was, unless something else changed it since. */
+      const restore = async () => {
+        await this.store.update((draft) => {
+          if (!sameBinding(draft.bindings[agentId], pinned)) return;
+          if (seen) draft.bindings[agentId] = seen;
+          else delete draft.bindings[agentId];
+        });
+      };
       const row: SwitchRow = {
         family,
         from: findAccount(state, current)?.label ?? null,
@@ -4722,26 +4811,56 @@ export class Service {
         toFamily: null,
         toProvider: null,
         outcome: "switched",
-        detail: null,
+        detail: ended.length > 0 ? `${ended.length === 1 ? "Its background job was" : `Its ${ended.length} background jobs were`} stopped to move it.` : null,
         at: new Date(now).toISOString(),
       };
-      // Nobody asked from this agent's own tab, so background work it left running isn't cut short,
-      // unless the caller asked for exactly that.
-      const ask: ReopenAsk = { stopBackgroundWork: options.stopBackgroundWork === true };
-      const result = await this.reopenAgent(paseo, agentId, { row, unattended: true, ask });
-      const stopped = result.outcome === "reopened" ? ask.jobs ?? [] : [];
-      await this.noteOutcome(paseo, agentId, stopped.length > 0
-        ? { ...row, detail: `${stopped.length === 1 ? "Its background job was" : `Its ${stopped.length} background jobs were`} stopped to move it.` }
-        : row, result);
-      if (result.outcome === "reopened") return reply("moved", null, { stopped });
-      if (result.outcome === "deferred") {
-        const why = ask.waitingFor ?? "turn";
-        return reply("waiting", why === "background" ? "It moves once its background work ends." : "It moves once its turn ends.", { waitingFor: why, backgroundWork: why === "background" ? ask.jobs ?? [] : [] });
-      }
-      if (result.outcome === "failed") return refused(`It couldn't be reopened on that account: ${result.error}`);
-      return refused("The agent isn't open.");
+      const hadDeferred = this.deferred.has(agentId);
+      const move = (async (): Promise<MoveBeforeLimitReply> => {
+        try {
+          // Background work was dealt with above; a turn that starts now still holds the reload back.
+          const result = await this.reopenAgent(paseo, agentId, { unattended: !stopWork });
+          const after = await this.store.read();
+          liveOn = this.runningOn(after, agentId, family) ?? liveOn;
+          if (result.outcome === "deferred") {
+            // Nothing is left waiting: the caller asks again.
+            if (!hadDeferred) this.deferred.delete(agentId);
+            await restore();
+            const latest = await agentInfo(paseo, agentId);
+            const left = latest && !busy(latest) ? await this.workingInBackground(paseo, latest) : null;
+            return left ? waitWork(left.jobs, stopped) : waitTurn(stopped);
+          }
+          if (result.outcome === "reopened" && liveOn === current) {
+            // Routing kept it where it was: the account couldn't take it by the time it reopened.
+            await restore();
+            return reply("refused", "ineligible_target", `${target.label} couldn't take it by then, so it stayed where it was.`, { stopped: ended });
+          }
+          if (result.outcome === "reopened") {
+            // Counted once it has changed accounts, wherever it landed.
+            this.switchGuard.note(agentId, Date.now());
+            this.notePlacement(liveOn ?? target.id, Date.now());
+            await this.appendRow(paseo, agentId, await this.landed(row, agentId));
+            if (liveOn === target.id) return reply("moved", null, null, { stopped: ended });
+            const there = findAccount(after, liveOn)?.label ?? liveOn;
+            return reply("refused", "landed_elsewhere", `It reopened on ${there ?? "another account"} instead: ${target.label} couldn't take it by then.`, { stopped: ended });
+          }
+          if (result.outcome === "failed" && result.timedOut) {
+            // The reload may yet open: the binding stays, and the row says the move is still to come.
+            await this.noteOutcome(paseo, agentId, row, result);
+            return reply("pending", null, "The reload is taking a while. The agent's timeline and zerosub.state say where it lands.", { stopped: ended });
+          }
+          await restore();
+          if (result.outcome === "failed") return reply("refused", "reload_failed", `It couldn't be reopened on that account: ${result.error}`, { stopped });
+          return reply("refused", "not_open", "The agent isn't open.", { stopped });
+        } finally {
+          release();
+        }
+      })();
+      handedOff = true;
+      if (await settles(move, replyBy - Date.now())) return move;
+      move.catch((error: unknown) => log(`moving ${agentId} before the limit failed`, error));
+      return reply("pending", null, "It's still moving. The agent's timeline and zerosub.state say where it lands.", { stopped: ended });
     } finally {
-      release();
+      if (!handedOff) release();
     }
   }
 
@@ -4765,7 +4884,7 @@ export class Service {
     const account = findAccount(state, accountId);
     if (!account) throw new Error("That account no longer exists.");
     if (account.kind === "main") {
-      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout`, `cursor-agent logout` or Pi's /logout instead.");
+      throw new Error("Your CLI login can't be removed here. Sign out with `claude auth logout`, `codex logout`, `grok logout`, `cursor-agent logout`, Antigravity's /logout, or Pi's /logout instead.");
     }
     if (!this.adapters[account.family].portable) {
       // These conversations can't move to another ChatGPT account, so removing theirs would strand them.
@@ -4797,10 +4916,10 @@ export class Service {
     const signsOut = kept && signOut && account.family !== "pi" && account.auth !== "api" && !(await reachesCliHome(account.home!));
     await this.store.update((draft) => {
       const removed = findAccount(draft, accountId);
-      const peer = removed && claudeLoginPeer(draft, removed);
+      const peer = removed && subscriptionLoginPeer(draft, removed);
       if (removed && peer?.kind === "main" && peer.signedIn && peer.disabled && peer.pausedFor === removed.id) {
         peer.disabled = false;
-        preferClaudeLogin(draft, peer, removed);
+        preferSubscriptionLogin(draft, peer, removed, this.adapters[peer.family].portable);
       }
       draft.accounts = draft.accounts.filter((entry) => entry.id !== accountId);
       for (const entry of draft.accounts) {
@@ -5504,7 +5623,7 @@ export class Service {
       account = newAccount({ id, family: "claude", kind: "managed", home });
       draft.accounts.push(account);
       applyIdentity(account, identity, draft);
-      enforceClaudeLoginPair(draft, account);
+      enforceSubscriptionLoginPair(draft, account, this.adapters.claude.portable);
       // A removed account's folder that's back isn't cleaned up after all.
       for (const folder of Object.keys(draft.cleanup)) if (resolve(folder) === home) delete draft.cleanup[folder];
     });
@@ -6031,7 +6150,10 @@ export class Service {
           : `Couldn't tell which workspace member signed in, because Codex didn't return an email. Sign in again as ${expected}.`,
       );
     }
-    const duplicate = existing?.kind === "main" ? undefined : managedLoginDuplicate(state, session.family, identity, session.accountId);
+    const refreshCli = session.family === "antigravity" && existing?.kind !== "main";
+    if (refreshCli) await this.refreshIdentity(MAIN_ACCOUNT_ID.antigravity);
+    const duplicate = existing?.kind === "main" ? undefined :
+      managedLoginDuplicate(refreshCli ? await this.store.read() : state, session.family, identity, session.accountId);
     if (duplicate) {
       if (!existing && session.home) await adapter.logout(session.home).catch(() => undefined);
       return this.failLogin(
@@ -6069,7 +6191,7 @@ export class Service {
         account.limitKind = null;
         account.modelLimits = {};
         handedOver = applyIdentity(account, identity, draft);
-        enforceClaudeLoginPair(draft, account);
+        enforceSubscriptionLoginPair(draft, account, this.adapters[account.family].portable);
       });
     } catch (error) {
       // A new account's home is then cleaned up as an unfinished sign-in, like any that failed.
@@ -6270,28 +6392,48 @@ function sameSubscription(state: StoredState, account: StoredAccount): StoredAcc
   return accountsOf(state, account.family).filter((other) => other.id !== account.id && sameAccountIdentity(account.family, other, account));
 }
 
-/** Claude allows one managed login beside its native CLI login. Other duplicates are still refused. */
+/** Pair Codex logins only when both the workspace and its member are known. */
+function canPairSubscription(family: Family, account: StoredAccount, login: Pick<Identity, "identity" | "email">): boolean {
+  if (family === "pi" || account.auth !== "subscription") return false;
+  if (family === "codex" && (!account.email || !login.email || withoutWorkspace(account.identity) || withoutWorkspace(login.identity))) return false;
+  return sameAccountIdentity(family, account, login);
+}
+
+/** Allow one subscription login beside the CLI login while still rejecting managed duplicates. */
 function managedLoginDuplicate(state: StoredState, family: Family, identity: Identity, except?: string | null): StoredAccount | undefined {
   return accountsOf(state, family).find((other) =>
-    other.id !== except && (family !== "claude" || other.kind !== "main" || other.auth !== "subscription") &&
+    other.id !== except && (other.kind !== "main" || !canPairSubscription(family, other, identity)) &&
     sameAccountIdentity(family, other, identity, true),
   );
 }
 
-function claudeLoginPeer(state: StoredState, account: StoredAccount): StoredAccount | undefined {
-  if (account.family !== "claude" || account.auth !== "subscription") return undefined;
-  return sameSubscription(state, account).find((other) => other.kind !== account.kind && other.auth === "subscription");
+function subscriptionLoginPeer(state: StoredState, account: StoredAccount): StoredAccount | undefined {
+  if (account.auth !== "subscription") return undefined;
+  return accountsOf(state, account.family).find((other) =>
+    other.kind !== account.kind && other.auth === "subscription" && canPairSubscription(account.family, other, account),
+  );
 }
 
 /** The two logins share a subscription. Transfer routing and known limits without changing either sign-in. */
-function preferClaudeLogin(state: StoredState, account: StoredAccount, peer: StoredAccount): void {
+function preferSubscriptionLogin(state: StoredState, account: StoredAccount, peer: StoredAccount, portable: boolean): void {
   delete account.pausedFor;
   if (!peer.disabled) peer.pausedFor = account.id;
   peer.disabled = true;
-  if (defaultAccount(state, "claude")?.id === peer.id) state.defaults.claude = account.id;
-  if (state.nextAgent.claude?.accountId === peer.id) state.nextAgent.claude.accountId = account.id;
-  for (const binding of Object.values(state.bindings)) {
-    if (binding.accountId === peer.id) binding.accountId = account.id;
+  const { family } = account;
+  if (defaultAccount(state, family)?.id === peer.id) state.defaults[family] = account.id;
+  const next = state.nextAgent[family];
+  if (next?.accountId === peer.id) next.accountId = account.id;
+  if (portable) {
+    for (const binding of Object.values(state.bindings)) {
+      if (binding.accountId === peer.id) binding.accountId = account.id;
+    }
+  } else {
+    // Older sessions may have a home on record without a binding.
+    for (const [agentId, session] of Object.entries(state.sessions)) {
+      if (session.family === family && !state.bindings[agentId]) {
+        state.bindings[agentId] = { accountId: session.accountId, source: "thread", at: session.openedAt };
+      }
+    }
   }
   const now = Date.now();
   if (isLimited(peer, now) && !isLimited(account, now)) {
@@ -6306,11 +6448,6 @@ function preferClaudeLogin(state: StoredState, account: StoredAccount, peer: Sto
 }
 
 /** Returns true when the CLI login's account was replaced by a different one, which drops what the slot knew of the old one's limit. */
-/** The agent is pinned to `accountId` with `allowLimited`, so a limit there doesn't move it. */
-function keptAtLimit(binding: Binding | undefined, accountId: string): boolean {
-  return binding?.allowLimited === true && binding.accountId === accountId;
-}
-
 function applyIdentity(account: StoredAccount, identity: Identity, state: StoredState): boolean {
   const handedOver = account.kind === "main" && identity.signedIn && !!account.identity && !!identity.identity && !sameAccountIdentity(account.family, account, identity);
   applyIdentityFields(account, identity, state);
@@ -6336,11 +6473,11 @@ function applyIdentity(account: StoredAccount, identity: Identity, state: Stored
   return true;
 }
 
-function enforceClaudeLoginPair(state: StoredState, account: StoredAccount): void {
+function enforceSubscriptionLoginPair(state: StoredState, account: StoredAccount, portable: boolean): void {
   if (!account.signedIn || !account.identity || account.disabled) return;
-  const peer = claudeLoginPeer(state, account);
-  if (peer && account.kind === "managed") preferClaudeLogin(state, account, peer);
-  else if (peer?.signedIn && !peer.disabled) preferClaudeLogin(state, peer, account);
+  const peer = subscriptionLoginPeer(state, account);
+  if (peer && account.kind === "managed") preferSubscriptionLogin(state, account, peer, portable);
+  else if (peer?.signedIn && !peer.disabled) preferSubscriptionLogin(state, peer, account, portable);
 }
 
 function applyIdentityFields(account: StoredAccount, identity: Identity, state: StoredState): void {
@@ -6351,10 +6488,10 @@ function applyIdentityFields(account: StoredAccount, identity: Identity, state: 
   }
   // A key read without its workspace says less than the one stored for the same person, which stays.
   const vaguer = withoutWorkspace(identity.identity) && !withoutWorkspace(account.identity) && sameAccountIdentity(account.family, account, identity);
-  account.email = identity.email ?? account.email;
+  account.email = account.family === "antigravity" ? identity.email : identity.email ?? account.email;
   account.plan = identity.plan ?? account.plan;
   account.organization = identity.organization ?? account.organization;
-  if (!vaguer) account.identity = identity.identity ?? account.identity;
+  if (!vaguer) account.identity = account.family === "antigravity" ? identity.identity : identity.identity ?? account.identity;
   // An identity without an email (Pi's) has nothing better to call an account that has a name.
   if ((account.autoLabel && (identity.email || !account.label)) || !account.label) {
     account.label = suggestLabel(account, state);

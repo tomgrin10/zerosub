@@ -13,7 +13,8 @@ import { MAIN_ACCOUNT_ID, StateStore, type OpenCodeFork, type StoredAccount, typ
 import { buildTranscript, continuationPrompt } from "./handoff";
 import { paceScore } from "./routing";
 import { saveReadings } from "./usage";
-import type { Usage } from "../shared/model";
+import { StateViewSchema, type Usage } from "../shared/model";
+import { getState } from "../shared/rpc";
 import { preferences } from "../shared/preferences";
 import { absentPi } from "./fakes.test-support";
 
@@ -249,7 +250,7 @@ describe("a pin that allows a limited account", () => {
   it("leaves the agent where it is when its account hits the limit", async () => {
     // Extra usage on the account ran out mid-turn: carrying the work on elsewhere would put it on an
     // account the caller chose not to use.
-    const { store, reopened, sent, limitTurn } = await setUp(
+    const { service, store, reopened, sent, notes, paseo, limitTurn } = await setUp(
       {
         accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed")] as never,
         defaults: { claude: HELLO, codex: null, pi: null },
@@ -265,6 +266,90 @@ describe("a pin that allows a limited account", () => {
     expect(state.bindings[AGENT]).toMatchObject({ accountId: MAIN, allowLimited: true });
     expect(reopened).toEqual([]);
     expect(sent).toEqual([]);
+    // The stop is on the timeline, marked as the pin's, not as a lack of room.
+    expect(notes).toEqual([
+      expect.objectContaining({ from: "main", to: "main", reason: "limit", outcome: "stayed", continued: false, continuedIn: null, allowLimited: true }),
+    ]);
+    // And the state confirms the pin took.
+    expect((await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)).toMatchObject({ accountId: MAIN, allowLimited: true });
+  });
+
+  it("keeps the flag out of a plain pin's state and rows", async () => {
+    const { service, store, notes, paseo, limitTurn } = await setUp(
+      {
+        accounts: [account(MAIN, "main", "main"), account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+    );
+    await service.setAgentAccount(paseo as never, AGENT, MAIN);
+    expect((await service.view(paseo as never)).agents.find((route) => route.agentId === AGENT)?.allowLimited).toBe(false);
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.every((note) => !("allowLimited" in note))).toBe(true);
+  });
+
+  it("keeps a quota maximum apart from a provider limit", async () => {
+    // 81% used under an 80% maximum the user set: the account is at its ceiling, not at a provider limit.
+    const { service, store, paseo } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "main", "main"), quotaCeilings: { five_hour: 80 } }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        sessions: { [AGENT]: { accountId: HELLO, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+      {
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [{ id: "five_hour", label: "5-hour", usedPercent: 81, resetsAt: inFuture() }],
+          error: null, cached: false, resets: null,
+        }),
+      },
+    );
+    await service.refreshUsage(MAIN, true);
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN)).rejects.toThrow(/quota maximum/);
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN, { allowLimited: true })).rejects.toThrow(/quota maximum/);
+    expect((await store.read()).bindings[AGENT]).toBeUndefined();
+  });
+
+  it("leaves an agent pinned past its limit to move once its account reaches a quota maximum", async () => {
+    const { service, store, notes, limitTurn } = await setUp(
+      {
+        accounts: [{ ...account(MAIN, "main", "main"), quotaCeilings: { five_hour: 80 } }, account(HELLO, "hello", "managed")] as never,
+        defaults: { claude: HELLO, codex: null, pi: null },
+        bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true } },
+        sessions: { [AGENT]: { accountId: MAIN, family: "claude", openedAt: new Date().toISOString() } },
+      },
+      budget,
+      {
+        usage: () => ({
+          fetchedAt: new Date().toISOString(),
+          windows: [{ id: "five_hour", label: "5-hour", usedPercent: 81, resetsAt: inFuture() }],
+          error: null, cached: false, resets: null,
+        }),
+      },
+    );
+    await service.refreshUsage(MAIN, true);
+    await limitTurn();
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
+    expect(notes.at(-1)).toMatchObject({ from: "main", to: "hello", reason: "limit", outcome: "switched" });
+    expect(notes.at(-1)).not.toHaveProperty("allowLimited");
+  });
+
+  it("refuses the flag for an agent that can't move in place", async () => {
+    const { service, store, paseo, agent } = await setUp(
+      {
+        accounts: [{ ...account(MAIN_ACCOUNT_ID.codex, "chatgpt", "main"), family: "codex" }] as never,
+        defaults: { claude: null, codex: MAIN_ACCOUNT_ID.codex, pi: null },
+      },
+      budget,
+    );
+    agent.provider = "codex";
+    (service as unknown as { families: FamilyResolver }).families = { resolve: async () => ({ codex: "codex" as const }) } as unknown as FamilyResolver;
+    (service as unknown as { adapters: Record<string, FamilyAdapter> }).adapters.codex = { ...claudeAdapter(budget), family: "codex", portable: false } as FamilyAdapter;
+    await expect(service.setAgentAccount(paseo as never, AGENT, MAIN_ACCOUNT_ID.codex, { allowLimited: true })).rejects.toThrow(/can't be kept on an account past its limit/);
+    expect((await store.read()).bindings[AGENT]).toBeUndefined();
   });
 });
 
@@ -3563,6 +3648,38 @@ describe("changing the default account", () => {
     expect((await service.view(paseo)).agents.find((route) => route.agentId === "busy")?.waiting).toBe("turn");
   });
 
+  it("leaves an idle agent pinned past the limit after the pass listed it", async () => {
+    const { service, store, context, reopened } = await setUpAgents(
+      {
+        accounts: [account(MAIN, "marketing", "main"), account(WORK, "work", "managed")] as never,
+        defaults: { claude: MAIN, codex: null, pi: null },
+        sessions: { failing: session(MAIN), quiet: session(MAIN) },
+      },
+      [
+        { id: "failing", status: "idle" },
+        { id: "quiet", status: "idle" },
+      ],
+    );
+    service.setPreferences(preferences.schema.parse({ autoSwitch: true, autoContinue: false, moveAgentsOnDefaultChange: false }));
+    const pass = vi.spyOn(service as unknown as { moveIdleAgentsOff: () => Promise<void> }, "moveIdleAgentsOff");
+    // The pin lands after the pass built its list, while it reads the agent's last turn.
+    vi.spyOn(service as unknown as { lastTurnHitLimit: (paseo: unknown, id: string) => Promise<boolean> }, "lastTurnHitLimit").mockImplementation(async (_paseo, id) => {
+      if (id === "quiet") {
+        await store.update((draft) => {
+          draft.bindings.quiet = { accountId: MAIN, source: "user", at: new Date().toISOString(), allowLimited: true };
+        });
+      }
+      return false;
+    });
+    await service.onTurnEnded({ agent: { id: "failing", provider: "claude" }, turnId: null, outcome: { kind: "failed", error: { message: "limit" } }, timeline: [] } as never, context);
+    await vi.waitFor(() => expect(pass).toHaveBeenCalled());
+    await pass.mock.results[0]!.value;
+    expect(reopened).not.toContain("quiet");
+    const state = await store.read();
+    expect(state.sessions.quiet?.accountId).toBe(MAIN);
+    expect(state.bindings.quiet).toMatchObject({ accountId: MAIN, allowLimited: true });
+  });
+
   it("leaves an agent with background work when moving idle agents off an account at its limit", async () => {
     const { service, store, paseo, context, reopened } = await setUpAgents(
       {
@@ -4525,6 +4642,28 @@ describe("a move asked for during a turn", () => {
     expect(state.bindings[AGENT]).toMatchObject({ accountId: WORK, source: "user" });
     expect(reopened).toEqual([AGENT]);
     expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "work", reason: "limit", outcome: "switched" })]);
+  });
+
+  it("goes where it was asked to with allowLimited, though that account is at its limit", async () => {
+    // A pin past the limit, asked for during a turn on another account: that turn's limit must not
+    // pin the agent to whichever account has the most room.
+    const state = threeAccounts();
+    (state.accounts as unknown as StoredAccount[])[2] = { ...account(WORK, "work", "managed"), limitedUntil: inFuture(), limitKind: "budget" } as never;
+    const { service, store, reopened, notes, sent, paseo, agent, limitTurn } = await setUp(state, limit);
+    agent.status = "running";
+    await service.setAgentAccount(paseo as never, AGENT, WORK, { allowLimited: true });
+    agent.status = "idle";
+    await limitTurn();
+
+    const after = await store.read();
+    expect(after.sessions[AGENT]?.accountId).toBe(WORK);
+    expect(after.bindings[AGENT]).toMatchObject({ accountId: WORK, source: "user", allowLimited: true });
+    expect(reopened).toEqual([AGENT]);
+    expect(notes).toEqual([expect.objectContaining({ from: "marketing", to: "work", reason: "limit", outcome: "switched" })]);
+    // The interrupted turn carries on there, and stays there.
+    expect(sent).toHaveLength(1);
+    expect((await service.alignSessions(paseo as never)).reopened).toEqual([]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(WORK);
   });
 
   it("happens once an agent that was only starting is idle, without a turn", async () => {
@@ -5962,6 +6101,27 @@ describe("a sign-out read while the token is being renewed", () => {
   });
 });
 
+describe("the state contract", () => {
+  const oneAccount = () => ({ accounts: [account(MAIN, "marketing", "main")] as never, defaults: { claude: MAIN, codex: null, pi: null }, sessions: {} });
+
+  it("serves the read-only state RPC at version 1", async () => {
+    expect(getState.name).toBe("zerosub.state");
+    expect(getState.output).toBe(StateViewSchema);
+    const { service, paseo } = await setUp(oneAccount(), () => null as never);
+    const view = await service.view(paseo as never);
+    expect(view.version).toBe(1);
+    expect(StateViewSchema.safeParse(view).success).toBe(true);
+  });
+
+  it("defaults an unversioned response to version 1 and rejects other versions", async () => {
+    const { service, paseo } = await setUp(oneAccount(), () => null as never);
+    const view = await service.view(paseo as never);
+    const { version: _dropped, ...unversioned } = view;
+    expect(StateViewSchema.parse(unversioned).version).toBe(1);
+    expect(StateViewSchema.safeParse({ ...view, version: 2 }).success).toBe(false);
+  });
+});
+
 // A plugin that stops a session at its own threshold (95% of the week, say) sees the limit coming
 // before ZeroSub does: to ZeroSub the account isn't out yet, so nothing moves the session and it stays
 // stopped while another account has room. `moveBeforeLimit` lets that plugin move this one agent,
@@ -5974,10 +6134,11 @@ describe("a move asked for before the limit", () => {
     ...extra,
   });
   const unused = () => ({ kind: "window" as const, resetsAt: inFuture(), message: "" });
+  const moved = { outcome: "moved", reason: null, retryable: false, accountId: HELLO, detail: null, waitingFor: null, backgroundWork: [], stopped: [] };
 
   it("moves an idle agent to the named account without pinning it there", async () => {
     const { service, store, reopened, notes, paseo } = await setUp(nearly(), unused);
-    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual({ outcome: "moved", detail: null, waitingFor: null, backgroundWork: [], stopped: [] });
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual(moved);
     expect(reopened).toEqual([AGENT]);
     const state = await store.read();
     expect(state.sessions[AGENT]?.accountId).toBe(HELLO);
@@ -5987,19 +6148,47 @@ describe("a move asked for before the limit", () => {
 
   it("says so when it's already there, and does nothing", async () => {
     const { service, reopened, paseo } = await setUp(nearly(), unused);
-    expect((await service.moveBeforeLimit(paseo as never, AGENT, MAIN)).outcome).toBe("already");
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, MAIN)).toMatchObject({ outcome: "already", reason: null, accountId: MAIN });
     expect(reopened).toEqual([]);
   });
 
-  it("waits for background work and a running turn", async () => {
+  it("answers a busy agent with a retryable wait and writes nothing", async () => {
     const jobs = await setUp(nearly(), unused);
     (jobs.agent as Record<string, unknown>).backgroundWork = { count: 2 };
-    expect((await jobs.service.moveBeforeLimit(jobs.paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect(await jobs.service.moveBeforeLimit(jobs.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "waiting", reason: "background_work", retryable: true, accountId: MAIN });
     expect(jobs.reopened).toEqual([]);
+    expect((await jobs.store.read()).bindings[AGENT]).toBeUndefined();
     const busy = await setUp(nearly(), unused);
     busy.agent.status = "running";
-    expect((await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    expect(await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "waiting", reason: "busy_turn", waitingFor: "turn", retryable: true });
     expect(busy.reopened).toEqual([]);
+    expect((await busy.store.read()).bindings[AGENT]).toBeUndefined();
+  });
+
+  it("leaves nothing queued behind a wait: the turn ends and the agent stays where it was", async () => {
+    const { service, store, reopened, notes, paseo, agent } = await setUp(nearly(), unused);
+    agent.status = "running";
+    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    agent.status = "idle";
+    await service.onTurnEnded({ agent: { id: AGENT, provider: "claude" }, turnId: "t", outcome: { kind: "completed" }, timeline: [] } as never, { paseo } as never);
+    await service.alignSessions(paseo as never);
+    expect(reopened).toEqual([]);
+    expect(notes).toEqual([]);
+    const state = await store.read();
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(state.bindings[AGENT]).toBeUndefined();
+    // Asked again once idle, it moves.
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual(moved);
+  });
+
+  it("doesn't spend the switch guard on asks that wait, so a real limit still moves the agent", async () => {
+    const { service, store, reopened, paseo, agent, limitTurn } = await setUp(nearly(), () => ({ kind: "window" as const, resetsAt: inFuture(), message: "You've hit your session limit" }));
+    agent.status = "running";
+    for (let ask = 0; ask < 6; ask += 1) expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
+    agent.status = "idle";
+    await limitTurn();
+    expect(reopened).toEqual([AGENT]);
+    expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
   });
 
   const withJobs = async () => {
@@ -6010,54 +6199,154 @@ describe("a move asked for before the limit", () => {
     return run;
   };
 
-  it("says what it waits for, naming the background work", async () => {
+  it("names the background work it waits for", async () => {
     const { service, paseo, reopened } = await withJobs();
     expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toEqual({
-      outcome: "waiting", detail: "It moves once its background work ends.", waitingFor: "background",
+      outcome: "waiting", reason: "background_work", retryable: true, accountId: MAIN,
+      detail: "It has background work running. Ask again once it ends, or with stopBackgroundWork.", waitingFor: "background",
       backgroundWork: [{ kind: "shell", description: "Run the test suite", command: "npm test" }], stopped: [],
     });
     expect(reopened).toEqual([]);
-    const busy = await setUp(nearly(), unused);
-    busy.agent.status = "running";
-    expect(await busy.service.moveBeforeLimit(busy.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "waiting", waitingFor: "turn", backgroundWork: [] });
   });
 
   it("stops the background work and moves at once when asked to", async () => {
     const { service, paseo, reopened, work, notes, store } = await withJobs();
     const result = await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true });
-    expect(result).toMatchObject({ outcome: "moved", waitingFor: null, stopped: [{ kind: "shell", description: "Run the test suite", command: "npm test" }] });
+    expect(result).toMatchObject({ outcome: "moved", accountId: HELLO, waitingFor: null, stopped: [{ kind: "shell", description: "Run the test suite", command: "npm test" }] });
     expect(work.stopped).toEqual(["b1"]);
     expect(reopened).toEqual([AGENT]);
     expect((await store.read()).sessions[AGENT]?.accountId).toBe(HELLO);
     expect(notes.at(-1)).toMatchObject({ to: "seat", reason: "near_limit", outcome: "switched", detail: "Its background job was stopped to move it." });
   });
 
-  it("isn't held back by work the daemon owns, which outlives the move", async () => {
-    const { service, paseo, reopened, work } = await withJobs();
-    work.items = [{ id: "daemon:heartbeat:h1", kind: "heartbeat", description: "Check the deploy" }];
-    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "moved", stopped: [] });
-    expect(work.stopped).toEqual([]);
-    expect(reopened).toEqual([AGENT]);
+  it("isn't held back by heartbeats or the daemon's own jobs, which outlive the move", async () => {
+    const daemonWork = [
+      { id: "heartbeat:h1", kind: "heartbeat", description: "Check the deploy", canStop: true },
+      { id: "daemon:watch:w1", kind: "monitor", description: "Watch the change request" },
+    ];
+    const only = await withJobs();
+    only.work.items = [...daemonWork];
+    expect(await only.service.moveBeforeLimit(only.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "moved", stopped: [] });
+    expect(only.work.stopped).toEqual([]);
+    expect(only.reopened).toEqual([AGENT]);
+    // Beside a provider shell, only the shell holds it back, and only the shell is stopped.
+    const mixed = await withJobs();
+    mixed.work.items = [...daemonWork, ...mixed.work.items];
+    expect(await mixed.service.moveBeforeLimit(mixed.paseo as never, AGENT, HELLO)).toMatchObject({
+      outcome: "waiting", reason: "background_work", backgroundWork: [{ kind: "shell", description: "Run the test suite", command: "npm test" }],
+    });
+    expect(await mixed.service.moveBeforeLimit(mixed.paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).toMatchObject({ outcome: "moved" });
+    expect(mixed.work.stopped).toEqual(["b1"]);
   });
 
-  it("asking again for a move that waits isn't counted by the switch guard", async () => {
+  it("doesn't reload an agent whose turn started while its background work was being stopped", async () => {
+    const { service, paseo, reopened, work, agent, store, notes } = await withJobs();
+    const backgroundWork = (paseo.agents.ref(AGENT) as unknown as { backgroundWork: { stop: (item: { id: string }) => Promise<void> } }).backgroundWork;
+    const stop = backgroundWork.stop;
+    // The handle is rebuilt for each ref: patch the fake's shared stop through a new ref.
+    const ref = paseo.agents.ref;
+    paseo.agents.ref = ((id?: string) => {
+      const handle = ref(id) as unknown as { backgroundWork?: { stop: (item: { id: string }) => Promise<void> } };
+      if (handle.backgroundWork) {
+        handle.backgroundWork = {
+          ...handle.backgroundWork,
+          stop: async (item: { id: string }) => {
+            await stop(item);
+            agent.status = "running"; // the user sent a message meanwhile
+          },
+        };
+      }
+      return handle;
+    }) as typeof ref;
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).toMatchObject({
+      outcome: "waiting", reason: "busy_turn", retryable: true, accountId: MAIN,
+      stopped: [{ kind: "shell", description: "Run the test suite", command: "npm test" }],
+    });
+    expect(work.stopped).toEqual(["b1"]);
+    expect(reopened).toEqual([]);
+    expect(notes).toEqual([]);
+    expect((await store.read()).bindings[AGENT]).toBeUndefined();
+  });
+
+  it("asking again after a wait isn't counted by the switch guard", async () => {
     const { service, paseo, reopened } = await withJobs();
     for (let ask = 0; ask < 6; ask += 1) expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("waiting");
     expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).outcome).toBe("moved");
     expect(reopened).toEqual([AGENT]);
   });
 
+  it("says where the agent landed when the account hit its limit during the reload", async () => {
+    const WORK = "claude-work";
+    let store!: StateStore;
+    const run = await setUp(
+      nearly({ accounts: [account(MAIN, "main", "main"), account(HELLO, "seat", "managed"), account(WORK, "work", "managed")] as never }),
+      unused,
+      {
+        // Both the target and the account it's leaving reach their limits as it reloads: routing sends it to work.
+        reloading: async () => {
+          await store.update((draft) => {
+            for (const id of [HELLO, MAIN]) draft.accounts.find((entry) => entry.id === id)!.limitedUntil = inFuture();
+          });
+        },
+      },
+    );
+    store = run.store;
+    const result = await run.service.moveBeforeLimit(run.paseo as never, AGENT, HELLO);
+    expect((await run.store.read()).sessions[AGENT]?.accountId).toBe(WORK);
+    expect(result).toMatchObject({ outcome: "refused", reason: "landed_elsewhere", retryable: false, accountId: WORK });
+    // The row names where it really went, never the account that couldn't take it.
+    expect(run.notes).toEqual([expect.objectContaining({ from: "main", to: "work", reason: "near_limit", outcome: "switched" })]);
+  });
+
+  it("says it stayed when the account hit its limit during the reload and routing kept it where it was", async () => {
+    let store!: StateStore;
+    const run = await setUp(nearly(), unused, {
+      reloading: async () => {
+        await store.update((draft) => {
+          draft.accounts.find((entry) => entry.id === HELLO)!.limitedUntil = inFuture();
+        });
+      },
+    });
+    store = run.store;
+    expect(await run.service.moveBeforeLimit(run.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "ineligible_target", accountId: MAIN });
+    expect((await run.store.read()).sessions[AGENT]?.accountId).toBe(MAIN);
+    expect(run.notes).toEqual([]);
+  });
+
+  it("puts the agent's binding back when the reload fails, so the state and timeline don't show a move", async () => {
+    const { service, store, paseo, notes } = await setUp(nearly(), unused, { reload: "fails" });
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "reload_failed", retryable: true, accountId: MAIN });
+    const state = await store.read();
+    expect(state.bindings[AGENT]).toBeUndefined();
+    expect(state.sessions[AGENT]?.accountId).toBe(MAIN);
+    const route = (await service.view(paseo as never)).agents.find((entry) => entry.agentId === AGENT);
+    expect(route).toMatchObject({ accountId: MAIN, pendingAccountId: null });
+    expect(notes).toEqual([]);
+  });
+
+  it("refuses an API key or gateway key with paid fallback off", async () => {
+    for (const keyed of [
+      { ...account(HELLO, "key", "managed"), auth: "api", identity: "api|anthropic|0123456789abcdef" },
+      { ...account(HELLO, "gateway", "managed"), auth: "api" },
+    ]) {
+      const run = await setUp(nearly({ accounts: [account(MAIN, "main", "main"), keyed] as never }), unused);
+      expect(await run.service.moveBeforeLimit(run.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "ineligible_target", retryable: false });
+      expect(run.reopened).toEqual([]);
+      expect((await run.store.read()).bindings[AGENT]).toBeUndefined();
+    }
+  });
+
   it("refuses an account that can't take it, a closed agent, one the user pinned, and automatic switching off", async () => {
     const limited = await setUp(nearly({ accounts: [account(MAIN, "main", "main"), { ...account(HELLO, "seat", "managed"), limitedUntil: inFuture() }] as never }), unused);
-    expect((await limited.service.moveBeforeLimit(limited.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    expect(await limited.service.moveBeforeLimit(limited.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "ineligible_target" });
     const closed = await setUp(nearly(), unused);
     closed.agent.status = "closed";
-    expect((await closed.service.moveBeforeLimit(closed.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    expect(await closed.service.moveBeforeLimit(closed.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "not_open" });
     const pinned = await setUp(nearly({ bindings: { [AGENT]: { accountId: MAIN, source: "user", at: new Date().toISOString() } } }), unused);
-    expect(await pinned.service.moveBeforeLimit(pinned.paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).toMatchObject({ outcome: "refused", detail: "It stays on the account picked for it." });
+    expect(await pinned.service.moveBeforeLimit(pinned.paseo as never, AGENT, HELLO, { stopBackgroundWork: true })).toMatchObject({ outcome: "refused", reason: "user_pinned", detail: "It stays on the account picked for it." });
     const off = await setUp(nearly(), unused);
     off.service.setPreferences(preferences.schema.parse({ autoSwitch: false }));
-    expect((await off.service.moveBeforeLimit(off.paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    expect(await off.service.moveBeforeLimit(off.paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "auto_switch_off" });
     for (const run of [limited, closed, pinned, off]) expect(run.reopened).toEqual([]);
     expect((await pinned.store.read()).bindings[AGENT]).toMatchObject({ accountId: MAIN, source: "user" });
   });
@@ -6071,6 +6360,6 @@ describe("a move asked for before the limit", () => {
       expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("moved");
       await back();
     }
-    expect((await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).outcome).toBe("refused");
+    expect(await service.moveBeforeLimit(paseo as never, AGENT, HELLO)).toMatchObject({ outcome: "refused", reason: "switch_guard", retryable: true });
   });
 });
